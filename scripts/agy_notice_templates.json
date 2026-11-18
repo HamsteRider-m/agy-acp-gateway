@@ -1,0 +1,23 @@
+{
+ "templates": [
+  "API error (attempt %d): %vinvalid JSON arguments: %w%s read_file path is emptycapture_browser_screenshotstdout connected elsewherefailed to set PTY size: %w",
+  "Agent execution terminated due to error.",
+  "Authorization code submission timed out. Please try again.",
+  "ERROR\"`: Execution terminated due to an error.",
+  "Limit(no prior steps)args=<malformed>Please try againdelete_knowledgebrowser_mouse_upms-playwright-gomap_shadow_stackcredentials.",
+  "Noncharacter_Code_Pointprogram was interrupted",
+  "Our servers are experiencing high traffic right now, please try again in a minute.",
+  "Please continue from where you left off, keeping your response shorter",
+  "Please try again.",
+  "Step was interrupted due to server shutdown",
+  "The stream was interrupted.",
+  "The stream was interrupted. Please continue the task you were working on.",
+  "There was a network issue connecting to the server, please try again.",
+  "This usually takes about 30 seconds. Please try again later.",
+  "Thread finding callback was interrupted or crashed; can't fix this",
+  "Your image generation quota has been exceeded. Please try again later.",
+  "[))automatic continuation was interrupted after %d completed hop(s); the partial interaction (status requires_continuation) and its continuation_token can be used to resume  (%d earlier user turns not shown; besides the first",
+  "s]model output must contain either output text or tool calls, these cannot both be empty, please try again[Policy",
+  "the connection to the agent was interrupted before the response started: %wtheme schedule: entry %q: theme ID must be non-empty, lowercase and trimmedcannot change UTF-8 checks after a JSON object has already begun processing"
+ ]
+}
