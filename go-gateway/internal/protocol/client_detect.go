@@ -137,9 +137,16 @@ func detectClientFromPromptAndTools(convKey, sysCombined string, toolNames []str
 	lowSys := strings.ToLower(sysCombined)
 	toolSet := make(map[string]bool, len(toolNames))
 	hasDshNativeTool := false
+	hasWsCallTool := false
 	for _, tn := range toolNames {
 		low := strings.ToLower(strings.TrimSpace(tn))
-		if low == "" || gwcfg.IsInternalBridgeTool(low) {
+		if low == "" {
+			continue
+		}
+		if low == "ws_call_tool" {
+			hasWsCallTool = true
+		}
+		if gwcfg.IsInternalBridgeTool(low) {
 			continue
 		}
 		toolSet[low] = true
@@ -173,7 +180,7 @@ func detectClientFromPromptAndTools(convKey, sysCombined string, toolNames []str
 	}
 
 	if strings.Contains(lowSys, "ga-platform") ||
-		(toolSet["code_run"] && toolSet["file_read"] && toolSet["file_patch"] && (toolSet["update_working_checkpoint"] || toolSet["ws_call_tool"])) {
+		(toolSet["code_run"] && toolSet["file_read"] && toolSet["file_patch"] && (toolSet["update_working_checkpoint"] || hasWsCallTool)) {
 		return "genericagent", "GenericAgent", "Chat", true
 	}
 	if strings.Contains(lowSys, "<t3_code_instructions>") {

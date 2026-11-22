@@ -436,24 +436,29 @@ func fetchOfficialQuotaSync() QuotaSnapshot {
 
 // quotaCmdEnv builds the subprocess environment for `<agy> -p /usage`.
 // When PureApiHome holds an isolated gateway account token (antigravity-cli/antigravity-oauth-token),
-// it points HOME at a lightweight sibling quota-home whose .gemini symlinks to PureApiHome so /usage
-// reads the active gateway account instead of a stale/unlogged host ~/.gemini profile (which would
-// otherwise block on interactive OAuth until the 22s context timeout sends SIGKILL / "signal: killed").
+// it points HOME at a per-profile sibling quota-home-<base> whose .gemini symlinks to the absolute
+// PureApiHome path so /usage reads the active gateway account without colliding across sibling profiles
+// or hanging on stale/unlogged host ~/.gemini credentials.
 func quotaCmdEnv(baseEnv []string) []string {
 	env := make([]string, 0, len(baseEnv)+8)
 	hasSSH := false
 	var quotaHome string
 	if PureApiHome != "" {
-		tokPath := filepath.Join(PureApiHome, "antigravity-cli", "antigravity-oauth-token")
-		if fileExists(tokPath) {
-			qh := filepath.Join(filepath.Dir(PureApiHome), "quota-home")
-			linkPath := filepath.Join(qh, ".gemini")
-			if err := os.MkdirAll(qh, 0o700); err == nil {
-				if cur, err := os.Readlink(linkPath); err != nil || cur != PureApiHome {
-					_ = os.Remove(linkPath)
-					_ = os.Symlink(PureApiHome, linkPath)
+		if absPure, err := filepath.Abs(PureApiHome); err == nil {
+			tokPath := filepath.Join(absPure, "antigravity-cli", "antigravity-oauth-token")
+			if fileExists(tokPath) {
+				qh := filepath.Join(filepath.Dir(absPure), "quota-home-"+filepath.Base(absPure))
+				linkPath := filepath.Join(qh, ".gemini")
+				if err := os.MkdirAll(qh, 0o700); err == nil {
+					if cur, err := os.Readlink(linkPath); err != nil || cur != absPure {
+						_ = os.Remove(linkPath)
+						if err := os.Symlink(absPure, linkPath); err == nil {
+							quotaHome = qh
+						}
+					} else {
+						quotaHome = qh
+					}
 				}
-				quotaHome = qh
 			}
 		}
 	}
@@ -531,15 +536,18 @@ func fetchOfficialQuotaDo() QuotaSnapshot {
 		quotaMu.Lock()
 		defer quotaMu.Unlock()
 		lastQuotaAttemptAt = time.Now()
+		errMsg := "Unparseable /usage output: " + err.Error()
 		if cachedQuota != nil {
-			return markQuotaStaleLocked("Unparseable /usage output: " + err.Error())
+			return markQuotaStaleLocked(errMsg)
 		}
-		return QuotaSnapshot{
+		errSnap := QuotaSnapshot{
 			Status:    "error",
 			UpdatedAt: time.Now().UTC().Format(time.RFC3339),
-			Error:     err.Error(),
+			Error:     errMsg,
 			Groups:    []QuotaGroup{},
 		}
+		lastQuotaErr = &errSnap
+		return errSnap
 	}
 
 	var groups []QuotaGroup

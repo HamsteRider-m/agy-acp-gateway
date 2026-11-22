@@ -77,7 +77,23 @@ func TestDetectClientIdentityAndHistoricalBackfill(t *testing.T) {
 		}
 	})
 
-		t.Run("Pi via x-pi-session-id header", func(t *testing.T) {
+	t.Run("GenericAgent via ws_call_tool overrides proxy-spoofed Codex header", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		r.Header.Set("Originator", "codex_exec")
+		r.Header.Set("User-Agent", "codex_exec/0.139.0 (Windows 10.0.26200; x86_64)")
+		rawTools := []any{
+			map[string]any{"function": map[string]any{"name": "code_run"}},
+			map[string]any{"function": map[string]any{"name": "file_read"}},
+			map[string]any{"function": map[string]any{"name": "file_patch"}},
+			map[string]any{"function": map[string]any{"name": "ws_call_tool"}},
+		}
+		ci := DetectClientIdentity(r, map[string]any{}, "fp:ga2", "", "", rawTools)
+		if ci.ID != "genericagent" || ci.Label != "GenericAgent" || ci.Protocol != "Chat" || !ci.Known {
+			t.Fatalf("expected GenericAgent identity via ws_call_tool over spoofed codex_exec header, got %+v", ci)
+		}
+	})
+
+	t.Run("Pi via x-pi-session-id header", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 		r.Header.Set("x-pi-session-id", "pi-sess-42")
 		ci := DetectClientIdentity(r, map[string]any{}, "sid:pi-sess-42", "", "", nil)

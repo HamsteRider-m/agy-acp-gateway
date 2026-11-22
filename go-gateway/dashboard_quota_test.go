@@ -645,29 +645,59 @@ func TestFetchOfficialQuotaRefreshesAfterResetTimePasses(t *testing.T) {
 	t.Fatal("expected FetchOfficialQuota(false) to background-refresh within 3s once resetTime passed")
 }
 
-
-func TestQuotaCmdEnvUsesPureApiHome(t *testing.T) {
-	tmp := t.TempDir()
-	pure := filepath.Join(tmp, "pure-api-home")
-	cliDir := filepath.Join(pure, "antigravity-cli")
-	if err := os.MkdirAll(cliDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(cliDir, "antigravity-oauth-token"), []byte("tok"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	origPure := PureApiHome
-	PureApiHome = pure
-	defer func() { PureApiHome = origPure }()
-
-	env := quotaCmdEnv([]string{"HOME=/Users/other", "PATH=/usr/bin"})
-	wantHome := filepath.Join(tmp, "quota-home")
-	gotHome := ""
-	for _, kv := range env {
-		if strings.HasPrefix(kv, "HOME=") {
-			gotHome = strings.TrimPrefix(kv, "HOME=")
+func waitQuotaRefreshIdle(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		quotaFlightMu.Lock()
+		waitCh := quotaFlightWait
+		quotaFlightMu.Unlock()
+		if !quotaRefreshing.Load() && waitCh == nil {
+			return
+		}
+		if waitCh != nil {
+			select {
+			case <-waitCh:
+			case <-time.After(15 * time.Millisecond):
+			}
+		} else {
+			time.Sleep(15 * time.Millisecond)
 		}
 	}
+	t.Fatal("timed out waiting for background official quota refresh to finish")
+}
+
+func TestQuotaCmdEnvUsesPureApiHome(t *testing.T) {
+	origPure := PureApiHome
+	t.Cleanup(func() { PureApiHome = origPure })
+
+	setupProfile := func(t *testing.T, pure string) {
+		t.Helper()
+		cliDir := filepath.Join(pure, "antigravity-cli")
+		if err := os.MkdirAll(cliDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cliDir, "antigravity-oauth-token"), []byte("tok"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	extractHome := func(env []string) string {
+		for _, kv := range env {
+			if strings.HasPrefix(kv, "HOME=") {
+				return strings.TrimPrefix(kv, "HOME=")
+			}
+		}
+		return ""
+	}
+
+	tmp := t.TempDir()
+	pure := filepath.Join(tmp, "pure-api-home")
+	setupProfile(t, pure)
+	PureApiHome = pure
+
+	env := quotaCmdEnv([]string{"HOME=/Users/other", "PATH=/usr/bin"})
+	wantHome := filepath.Join(tmp, "quota-home-pure-api-home")
+	gotHome := extractHome(env)
 	if gotHome != wantHome {
 		t.Fatalf("expected isolated HOME=%q, got %q", wantHome, gotHome)
 	}
@@ -675,9 +705,61 @@ func TestQuotaCmdEnvUsesPureApiHome(t *testing.T) {
 	if err != nil || target != pure {
 		t.Fatalf("expected .gemini symlink -> %q, got %q (err=%v)", pure, target, err)
 	}
+
+	t.Run("sibling profiles do not collide", func(t *testing.T) {
+		sibTmp := t.TempDir()
+		profA := filepath.Join(sibTmp, "account-a")
+		profB := filepath.Join(sibTmp, "account-b")
+		setupProfile(t, profA)
+		setupProfile(t, profB)
+
+		PureApiHome = profA
+		homeA := extractHome(quotaCmdEnv([]string{"HOME=/Users/other"}))
+		PureApiHome = profB
+		homeB := extractHome(quotaCmdEnv([]string{"HOME=/Users/other"}))
+
+		wantA := filepath.Join(sibTmp, "quota-home-account-a")
+		wantB := filepath.Join(sibTmp, "quota-home-account-b")
+		if homeA != wantA || homeB != wantB || homeA == homeB {
+			t.Fatalf("expected distinct per-profile quota homes (%q, %q), got (%q, %q)", wantA, wantB, homeA, homeB)
+		}
+		if gotA, err := os.Readlink(filepath.Join(homeA, ".gemini")); err != nil || gotA != profA {
+			t.Fatalf("account-a symlink mutated after account-b run: got %q (err=%v), want %q", gotA, err, profA)
+		}
+		if gotB, err := os.Readlink(filepath.Join(homeB, ".gemini")); err != nil || gotB != profB {
+			t.Fatalf("account-b symlink mismatch: got %q (err=%v), want %q", gotB, err, profB)
+		}
+	})
+
+	t.Run("relative PureApiHome resolves to absolute symlink", func(t *testing.T) {
+		relTmp := t.TempDir()
+		t.Chdir(relTmp)
+		wd, err := os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		relPure := filepath.Join("runtime", "pure-api-home")
+		absPure := filepath.Join(wd, relPure)
+		setupProfile(t, absPure)
+
+		PureApiHome = relPure
+		gotRelHome := extractHome(quotaCmdEnv([]string{"HOME=/Users/other"}))
+		wantRelHome := filepath.Join(wd, "runtime", "quota-home-pure-api-home")
+		if !filepath.IsAbs(gotRelHome) || gotRelHome != wantRelHome {
+			t.Fatalf("expected absolute quota home %q, got %q", wantRelHome, gotRelHome)
+		}
+		linkTarget, err := os.Readlink(filepath.Join(gotRelHome, ".gemini"))
+		if err != nil || !filepath.IsAbs(linkTarget) || linkTarget != absPure {
+			t.Fatalf("expected absolute .gemini symlink -> %q, got %q (err=%v)", absPure, linkTarget, err)
+		}
+		if !fileExists(filepath.Join(gotRelHome, ".gemini", "antigravity-cli", "antigravity-oauth-token")) {
+			t.Fatalf("expected token reachable via .gemini symlink under %q", gotRelHome)
+		}
+	})
 }
 
 func TestFetchOfficialQuotaColdNonBlocking(t *testing.T) {
+	waitQuotaRefreshIdle(t)
 	quotaMu.Lock()
 	savedCache, savedAt, savedErr, savedAttempt := cachedQuota, cachedQuotaAt, lastQuotaErr, lastQuotaAttemptAt
 	cachedQuota, cachedQuotaAt, lastQuotaErr, lastQuotaAttemptAt = nil, time.Time{}, nil, time.Time{}
@@ -690,10 +772,12 @@ func TestFetchOfficialQuotaColdNonBlocking(t *testing.T) {
 
 	dir := t.TempDir()
 	slowBin := filepath.Join(dir, "agy-slow")
-	if err := os.WriteFile(slowBin, []byte("#!/bin/sh\nsleep 2\nexit 1\n"), 0o755); err != nil {
+	if err := os.WriteFile(slowBin, []byte("#!/bin/sh\nsleep 1\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AGY_QUOTA_BIN", slowBin)
+	// Registered after TempDir and Setenv so LIFO runs this drain first before restoring env/globals.
+	t.Cleanup(func() { waitQuotaRefreshIdle(t) })
 
 	start := time.Now()
 	snap := FetchOfficialQuota(false)
@@ -703,5 +787,53 @@ func TestFetchOfficialQuotaColdNonBlocking(t *testing.T) {
 	}
 	if snap.Status != QuotaStateLoading {
 		t.Fatalf("expected status=%q on cold non-blocking fetch, got %+v", QuotaStateLoading, snap)
+	}
+}
+
+func TestFetchOfficialQuotaColdInvalidJSONPersistsError(t *testing.T) {
+	waitQuotaRefreshIdle(t)
+	quotaMu.Lock()
+	savedCache, savedAt, savedErr, savedAttempt := cachedQuota, cachedQuotaAt, lastQuotaErr, lastQuotaAttemptAt
+	cachedQuota, cachedQuotaAt, lastQuotaErr, lastQuotaAttemptAt = nil, time.Time{}, nil, time.Time{}
+	quotaMu.Unlock()
+	t.Cleanup(func() {
+		quotaMu.Lock()
+		cachedQuota, cachedQuotaAt, lastQuotaErr, lastQuotaAttemptAt = savedCache, savedAt, savedErr, savedAttempt
+		quotaMu.Unlock()
+	})
+
+	dir := t.TempDir()
+	countFile := filepath.Join(dir, "calls.txt")
+	badBin := filepath.Join(dir, "agy-bad-json")
+	script := "#!/bin/sh\necho x >> " + countFile + "\necho 'not-valid-json'\nexit 0\n"
+	if err := os.WriteFile(badBin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGY_QUOTA_BIN", badBin)
+	t.Cleanup(func() { waitQuotaRefreshIdle(t) })
+
+	snap := FetchOfficialQuota(false)
+	if snap.Status != QuotaStateLoading {
+		t.Fatalf("expected initial status=%q, got %+v", QuotaStateLoading, snap)
+	}
+
+	waitQuotaRefreshIdle(t)
+
+	for i := 0; i < 2; i++ {
+		snap = FetchOfficialQuota(false)
+		if snap.Status != QuotaStateError {
+			t.Fatalf("poll %d: expected persisted error status=%q, got %+v", i+1, QuotaStateError, snap)
+		}
+		if !strings.Contains(snap.Error, "Unparseable") {
+			t.Fatalf("poll %d: expected unparseable error detail, got %q", i+1, snap.Error)
+		}
+	}
+
+	rawCalls, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(rawCalls), "x"); got != 1 {
+		t.Fatalf("expected 30s cooldown to throttle retries to 1 invocation, got %d", got)
 	}
 }
