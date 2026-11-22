@@ -212,6 +212,10 @@ func (e *SharedAcpEngine) EnsureStarted() error {
 	}()
 
 	EnsurePureApiHome()
+	absPure := PureApiHome
+	if a, err := filepath.Abs(PureApiHome); err == nil && a != "" {
+		absPure = a
+	}
 	// Child agy processes keep an isolated 180MiB GOMEMLIMIT rather than inheriting the
 	// gateway's 256MiB ceiling so 8 resident workers stay well inside container memory bounds.
 	snap := gwcfg.Current()
@@ -221,7 +225,7 @@ func (e *SharedAcpEngine) EnsureStarted() error {
 	proxy := snap.UpstreamProxy
 
 	LogEvent("ACP_ENGINE_START", "Starting single shared agy-acp-900k Pure-API engine (Go Native)", map[string]any{
-		"home":       PureApiHome,
+		"home":       absPure,
 		"gomemlimit": gomem,
 	})
 
@@ -229,7 +233,7 @@ func (e *SharedAcpEngine) EnsureStarted() error {
 	cmd := exec.Command(
 		PatchedAgyBin,
 		"acp",
-		"--gemini-dir", PureApiHome,
+		"--gemini-dir", absPure,
 		"--app-data-dir", "antigravity-cli",
 		"--agent", McpBridgeName,
 		"--process-per-session",
@@ -238,11 +242,13 @@ func (e *SharedAcpEngine) EnsureStarted() error {
 	)
 	cmd.Dir = DefaultCwd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	env := make([]string, 0, len(os.Environ())+8)
+	env := make([]string, 0, len(os.Environ())+10)
 	for _, kv := range os.Environ() {
 		switch {
 		case strings.HasPrefix(kv, "GOGC="),
 			strings.HasPrefix(kv, "GOMEMLIMIT="),
+			strings.HasPrefix(kv, "GEMINI_HOME="),
+			strings.HasPrefix(kv, "AGY_ACP_FORCE_FILE_STORAGE="),
 			strings.HasPrefix(kv, "DBUS_SESSION_BUS_ADDRESS="),
 			strings.HasPrefix(kv, "HTTP_PROXY="),
 			strings.HasPrefix(kv, "HTTPS_PROXY="),
@@ -255,6 +261,8 @@ func (e *SharedAcpEngine) EnsureStarted() error {
 	env = append(env,
 		"GOGC="+gogc,
 		"GOMEMLIMIT="+gomem,
+		"GEMINI_HOME="+absPure,
+		"AGY_ACP_FORCE_FILE_STORAGE=1",
 		"DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null",
 		"HTTP_PROXY="+proxy,
 		"HTTPS_PROXY="+proxy,

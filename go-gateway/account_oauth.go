@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,39 +15,26 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
-	"unsafe"
 
 	gwcfg "agy-acp-gateway-go/internal/config"
 )
 
-func openLinuxPTY() (master *os.File, slave *os.File, err error) {
-	ptmx, err := os.OpenFile("/dev/ptmx", os.O_RDWR|syscall.O_NOCTTY|syscall.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, nil, err
-	}
-	var unlock int32
-	const tiocsptlck = 0x40045431
-	const tiocgptn = 0x80045430
-	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), tiocsptlck, uintptr(unsafe.Pointer(&unlock))); errno != 0 {
-		_ = ptmx.Close()
-		return nil, nil, errno
-	}
-	var ptn uint32
-	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), tiocgptn, uintptr(unsafe.Pointer(&ptn))); errno != 0 {
-		_ = ptmx.Close()
-		return nil, nil, errno
-	}
-	pts, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", ptn), os.O_RDWR|syscall.O_NOCTTY, 0)
-	if err != nil {
-		_ = ptmx.Close()
-		return nil, nil, err
-	}
-	return ptmx, pts, nil
-}
+const antigravityCodeRedirectURI = "https://antigravity.google/oauth-callback"
+
+var (
+	oauthSessionTTL    = 5 * time.Minute
+	oauthStartTimeout  = 12 * time.Second
+	oauthSubmitTimeout = 30 * time.Second
+	oauthVerifyTimeout = 15 * time.Second
+	oauthVerifyInTest  = false
+	validRawAuthCodeRe = regexp.MustCompile(`^[A-Za-z0-9._/~%+=:-]+$`)
+)
 
 func redactAccountErrorString(s string, proxyStr string) string {
 	if proxyStr != "" {
@@ -59,6 +48,15 @@ func redactAccountErrorString(s string, proxyStr string) string {
 func isStrippedSubprocessEnv(kv string) bool {
 	for _, prefix := range []string{
 		"HOME=", "BROWSER=",
+		"DISPLAY=", "WAYLAND_DISPLAY=",
+		"GEMINI_HOME=",
+		"GEMINI_API_KEY=", "GOOGLE_API_KEY=", "GOOGLE_APPLICATION_CREDENTIALS=",
+		"GOOGLE_CLOUD_PROJECT=", "GOOGLE_CLOUD_LOCATION=", "GOOGLE_CLOUD_QUOTA_PROJECT=",
+		"GOOGLE_GENAI_USE_VERTEXAI=", "GCLOUD_PROJECT=", "CLOUDSDK_CORE_PROJECT=",
+		"AGY_ACP_CCPA_PROJECT=", "AGY_ACP_ENABLE_OAUTH=",
+		"AGY_ACP_FORCE_FILE_STORAGE=", "AGY_CLI_DISABLE_AUTO_UPDATE=",
+		"SSH_CONNECTION=", "SSH_TTY=", "SSH_CLIENT=",
+		"DBUS_SESSION_BUS_ADDRESS=",
 		"HTTP_PROXY=", "HTTPS_PROXY=", "http_proxy=", "https_proxy=",
 		"NO_PROXY=", "no_proxy=",
 		"AGY_API_KEYS=", "AGY_API_KEYS_FILE=",
@@ -70,6 +68,46 @@ func isStrippedSubprocessEnv(kv string) bool {
 		}
 	}
 	return false
+}
+
+func oauthSubprocessEnv(homeDir, geminiDir, proxy string) []string {
+	env := make([]string, 0, len(os.Environ())+12)
+	for _, kv := range os.Environ() {
+		if isStrippedSubprocessEnv(kv) {
+			continue
+		}
+		env = append(env, kv)
+	}
+	env = append(env,
+		"HOME="+homeDir,
+		"GEMINI_HOME="+geminiDir,
+		"AGY_ACP_FORCE_FILE_STORAGE=1",
+		"AGY_CLI_DISABLE_AUTO_UPDATE=1",
+		"SSH_CONNECTION=127.0.0.1 0 127.0.0.1 0",
+		"BROWSER=/bin/false",
+		"DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null",
+		"HTTP_PROXY="+proxy,
+		"HTTPS_PROXY="+proxy,
+		"NO_PROXY=127.0.0.1,localhost,::1",
+		"no_proxy=127.0.0.1,localhost,::1",
+	)
+	return env
+}
+
+func newOAuthFlowID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return hex.EncodeToString(b[:])
+	}
+	return fmt.Sprintf("flow-%d", time.Now().UnixNano())
+}
+
+func resetPrimaryQuotaCache() {
+	quotaMu.Lock()
+	cachedQuota = nil
+	cachedQuotaAt = time.Time{}
+	lastQuotaAttemptAt = time.Time{}
+	quotaMu.Unlock()
 }
 
 // ManagedPeersForDashboard returns the peer configs for all enabled, authenticated non-primary accounts,
@@ -97,7 +135,7 @@ func (am *AccountManager) ManagedPeersForDashboard() (peers []gwcfg.DashboardPee
 				"boundKeys":       acc.BoundKeys,
 				"allowedModels":   acc.AllowedModels,
 				"defaultModels":   acc.DefaultModels,
-				"error":           "待网页 OAuth 授权或导入凭据",
+				"error":           "待 Google OAuth 登录或导入凭据",
 				"fetchedAt":       "",
 				"gateway": map[string]any{
 					"instanceId":          acc.ID,
@@ -107,7 +145,7 @@ func (am *AccountManager) ManagedPeersForDashboard() (peers []gwcfg.DashboardPee
 				},
 				"quota": QuotaSnapshot{
 					Status: "not_enabled",
-					Error:  "待网页 OAuth 授权",
+					Error:  "待 Google OAuth 登录",
 				},
 				"windows":       map[string]WindowAggregate{},
 				"canaryRoutes":  []map[string]any{},
@@ -280,11 +318,20 @@ func (am *AccountManager) DeleteAccount(accountID string) error {
 	if err != nil {
 		return err
 	}
+	var oldSess *pendingOAuthSession
 	am.oauthMu.Lock()
 	if old, exists := am.oauthActive[accountID]; exists && old != nil {
-		am.cancelOAuthSessionLocked(old, false)
+		oldSess = old
+		am.cancelOAuthSessionLocked(old)
+	}
+	if am.oauthState != nil {
+		delete(am.oauthState, accountID)
 	}
 	am.oauthMu.Unlock()
+	if oldSess != nil {
+		waitOAuthProcExit(oldSess, 3*time.Second)
+		cleanupOAuthSessionArtifacts(oldSess)
+	}
 	am.InvalidateTokenCache(accountID)
 	am.ClearStickyForAccount(accountID)
 	am.StopAccountWorker(accountID)
@@ -297,182 +344,18 @@ func (am *AccountManager) DeleteAccount(accountID string) error {
 	return nil
 }
 
-// StartOAuthLogin spawns `agy -p /login` with the account's isolated HOME and resolved proxy,
-// capturing the Google OAuth URL and waiting on stdin for the user's authorization code.
-func (am *AccountManager) StartOAuthLogin(accountID string) (string, error) {
-	accountID = strings.ToLower(strings.TrimSpace(accountID))
-	acc, ok := am.GetAccount(accountID)
-	if !ok {
-		return "", fmt.Errorf("未找到账号 %q", accountID)
+func (am *AccountManager) ensureOAuthMapsLocked() {
+	if am.oauthActive == nil {
+		am.oauthActive = make(map[string]*pendingOAuthSession)
 	}
-	if !acc.Primary {
-		am.StopAccountWorker(acc.ID)
+	if am.oauthState == nil {
+		am.oauthState = make(map[string]OAuthFlowSnapshot)
 	}
+}
 
-	am.oauthMu.Lock()
-	if old, exists := am.oauthActive[acc.ID]; exists && old != nil {
-		am.cancelOAuthSessionLocked(old, true)
-	}
-	am.oauthMu.Unlock()
-
-	homeDir := am.AccountHomeDir(acc.ID)
-	tokPath := am.AccountTokenPath(acc.ID)
-	if err := os.MkdirAll(filepath.Dir(tokPath), 0o700); err != nil {
-		return "", err
-	}
-	bakPath := tokPath + ".oauth-bak"
-	if fileExists(tokPath) {
-		_ = os.Rename(tokPath, bakPath)
-	}
-	am.InvalidateTokenCache(acc.ID)
-
-	proxy := am.ResolveAccountProxy(acc)
-	cmd := exec.Command(PatchedAgyBin, "-p", "/login")
-	cmd.Dir = homeDir
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	env := make([]string, 0, len(os.Environ())+10)
-	for _, kv := range os.Environ() {
-		if isStrippedSubprocessEnv(kv) {
-			continue
-		}
-		env = append(env, kv)
-	}
-	env = append(env,
-		"HOME="+homeDir,
-		"BROWSER=/bin/false",
-		"HTTP_PROXY="+proxy,
-		"HTTPS_PROXY="+proxy,
-		"NO_PROXY=127.0.0.1,localhost,::1",
-		"no_proxy=127.0.0.1,localhost,::1",
-	)
-	cmd.Env = env
-
-	var stdinPipe io.WriteCloser
-	var ptySlave *os.File
-	if ptmx, pts, ptyErr := openLinuxPTY(); ptyErr == nil {
-		cmd.Stdin = pts
-		stdinPipe = ptmx
-		ptySlave = pts
-	} else {
-		p, err := cmd.StdinPipe()
-		if err != nil {
-			if fileExists(bakPath) {
-				_ = os.Rename(bakPath, tokPath)
-				am.InvalidateTokenCache(acc.ID)
-			}
-			return "", err
-		}
-		stdinPipe = p
-	}
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		if ptySlave != nil {
-			_ = ptySlave.Close()
-		}
-		if stdinPipe != nil {
-			_ = stdinPipe.Close()
-		}
-		if fileExists(bakPath) {
-			_ = os.Rename(bakPath, tokPath)
-			am.InvalidateTokenCache(acc.ID)
-		}
-		return "", err
-	}
-	cmd.Stderr = cmd.Stdout
-
-	if err := cmd.Start(); err != nil {
-		if ptySlave != nil {
-			_ = ptySlave.Close()
-		}
-		if stdinPipe != nil {
-			_ = stdinPipe.Close()
-		}
-		if fileExists(bakPath) {
-			_ = os.Rename(bakPath, tokPath)
-			am.InvalidateTokenCache(acc.ID)
-		}
-		return "", err
-	}
-	if ptySlave != nil {
-		_ = ptySlave.Close()
-	}
-
-	sess := &pendingOAuthSession{
-		accountID: acc.ID,
-		cmd:       cmd,
-		stdin:     stdinPipe,
-		output:    &bytes.Buffer{},
-		tokenPath: tokPath,
-		bakPath:   bakPath,
-		startedAt: time.Now(),
-		done:      make(chan struct{}),
-		doneCh:    make(chan error, 1),
-	}
-
-	urlCh := make(chan string, 1)
-	go func() {
-		sc := bufio.NewScanner(stdoutPipe)
-		sc.Buffer(make([]byte, 64*1024), 512*1024)
-		sentURL := false
-		for sc.Scan() {
-			line := sc.Text()
-			sess.outMu.Lock()
-			sess.output.WriteString(line + "\n")
-			sess.outMu.Unlock()
-			if !sentURL {
-				if m := oauthURLRe.FindString(line); m != "" {
-					sentURL = true
-					urlCh <- m
-				}
-			}
-		}
-		waitErr := cmd.Wait()
-		close(sess.done)
-		sess.doneCh <- waitErr
-	}()
-
-	select {
-	case authURL := <-urlCh:
-		sess.authURL = authURL
-		am.oauthMu.Lock()
-		if old, exists := am.oauthActive[acc.ID]; exists && old != nil && old != sess {
-			am.cancelOAuthSessionLocked(old, false)
-		}
-		am.oauthActive[acc.ID] = sess
-		am.oauthMu.Unlock()
-		// Auto-reap after 70s if user abandons modal
-		go func(s *pendingOAuthSession) {
-			timer := time.NewTimer(70 * time.Second)
-			defer timer.Stop()
-			select {
-			case <-s.done:
-				return
-			case <-timer.C:
-				am.oauthMu.Lock()
-				if cur := am.oauthActive[s.accountID]; cur == s {
-					am.cancelOAuthSessionLocked(s, true)
-				}
-				am.oauthMu.Unlock()
-			}
-		}(sess)
-		return authURL, nil
-	case waitErr := <-sess.doneCh:
-		_ = stdinPipe.Close()
-		if fileExists(bakPath) && !fileExists(tokPath) {
-			_ = os.Rename(bakPath, tokPath)
-			am.InvalidateTokenCache(acc.ID)
-		}
-		sess.outMu.Lock()
-		outStr := strings.TrimSpace(sess.output.String())
-		sess.outMu.Unlock()
-		return "", fmt.Errorf("未能获取 OAuth 授权链接 (%v): %s", waitErr, redactAccountErrorString(truncateRunes(outStr, 200), proxy))
-	case <-time.After(8 * time.Second):
-		am.oauthMu.Lock()
-		am.cancelOAuthSessionLocked(sess, true)
-		am.oauthMu.Unlock()
-		return "", errors.New("启动 agy OAuth 握手超时 (8s)")
-	}
+func (am *AccountManager) recordOAuthSnapshotLocked(snap OAuthFlowSnapshot) {
+	am.ensureOAuthMapsLocked()
+	am.oauthState[snap.AccountID] = snap
 }
 
 func terminateOAuthProcGroup(s *pendingOAuthSession) {
@@ -482,7 +365,7 @@ func terminateOAuthProcGroup(s *pendingOAuthSession) {
 	pid := s.cmd.Process.Pid
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
 	go func(done <-chan struct{}, pgid int) {
-		timer := time.NewTimer(2 * time.Second)
+		timer := time.NewTimer(1500 * time.Millisecond)
 		defer timer.Stop()
 		if done != nil {
 			select {
@@ -497,16 +380,124 @@ func terminateOAuthProcGroup(s *pendingOAuthSession) {
 	}(s.done, pid)
 }
 
-func (am *AccountManager) cancelOAuthSessionLocked(s *pendingOAuthSession, restoreBackup bool) {
+func waitOAuthProcExit(s *pendingOAuthSession, waitFor time.Duration) {
+	if s == nil || s.done == nil {
+		return
+	}
+	timer := time.NewTimer(waitFor)
+	defer timer.Stop()
+	select {
+	case <-s.done:
+	case <-timer.C:
+		if s.cmd != nil && s.cmd.Process != nil {
+			_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL)
+		}
+		<-s.done
+	}
+}
+
+func cleanupOAuthSessionArtifacts(s *pendingOAuthSession) {
+	if s == nil {
+		return
+	}
+	if s.tempDir != "" {
+		_ = os.RemoveAll(s.tempDir)
+	}
+}
+
+func (am *AccountManager) cancelOAuthSessionLocked(s *pendingOAuthSession) {
 	delete(am.oauthActive, s.accountID)
 	if s.stdin != nil {
 		_ = s.stdin.Close()
 	}
 	terminateOAuthProcGroup(s)
-	if restoreBackup && s.bakPath != "" && fileExists(s.bakPath) && !fileExists(s.tokenPath) {
-		_ = os.Rename(s.bakPath, s.tokenPath)
-		am.InvalidateTokenCache(s.accountID)
+}
+
+// parseAntigravityCodeAuthURL strictly validates an OAuth URL returned by `agy acp --login`.
+func parseAntigravityCodeAuthURL(rawURL string) (authURL, redirectURI, state string, err error) {
+	if rawURL == "" || len(rawURL) > 16384 || strings.ContainsAny(rawURL, " \t\r\n") {
+		return "", "", "", errors.New("Antigravity 返回了无效的 Google 登录链接")
 	}
+	if strings.Contains(rawURL, "#") {
+		return "", "", "", errors.New("Antigravity 登录链接包含非法片段")
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", "", "", errors.New("Antigravity 返回了无法解析的 Google 登录链接")
+	}
+	if u.Scheme != "https" || !strings.EqualFold(u.Host, "accounts.google.com") || u.User != nil {
+		return "", "", "", errors.New("Antigravity 返回了非法的授权域名")
+	}
+	if u.Path != "/o/oauth2/auth" && u.Path != "/o/oauth2/v2/auth" {
+		return "", "", "", errors.New("Antigravity 返回了非预期的授权路径")
+	}
+	q := u.Query()
+	if len(q["response_type"]) != 1 || q.Get("response_type") != "code" {
+		return "", "", "", errors.New("Antigravity 授权链接缺少 response_type=code")
+	}
+	if len(q["state"]) != 1 {
+		return "", "", "", errors.New("Antigravity 授权链接缺少唯一 state 参数")
+	}
+	state = q.Get("state")
+	if state == "" || len(state) > 512 || strings.ContainsAny(state, " \t\r\n") {
+		return "", "", "", errors.New("Antigravity 授权链接 state 参数格式无效")
+	}
+	if len(q["redirect_uri"]) != 1 {
+		return "", "", "", errors.New("Antigravity 授权链接缺少唯一 redirect_uri")
+	}
+	redirectURI = q.Get("redirect_uri")
+	if redirectURI != antigravityCodeRedirectURI {
+		return "", "", "", errors.New("Antigravity 授权链接使用了非预期的 redirect_uri")
+	}
+	return rawURL, redirectURI, state, nil
+}
+
+// validateAntigravityLoginResponse validates either a raw authorization code or the full
+// Antigravity callback URL against the active login session's redirect_uri and state.
+func validateAntigravityLoginResponse(pendingRedirectURI, pendingState, rawInput string) (string, error) {
+	v := strings.TrimSpace(rawInput)
+	if v == "" {
+		return "", errors.New("授权码不能为空")
+	}
+	if len(v) > 16384 || strings.ContainsAny(v, " \t\r\n") {
+		return "", errors.New("输入包含空白或换行，请仅粘贴授权码或完整回调 URL")
+	}
+	low := strings.ToLower(v)
+	if strings.HasPrefix(low, "http://") || strings.HasPrefix(low, "https://") {
+		if strings.Contains(v, "#") {
+			return "", errors.New("回调 URL 不可包含 # 片段")
+		}
+		u, err := url.Parse(v)
+		if err != nil || u.Host == "" || u.User != nil {
+			return "", errors.New("回调 URL 格式无效，请粘贴完整的授权跳转 URL")
+		}
+		originPath := strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host) + u.Path
+		expected := pendingRedirectURI
+		if expected == "" {
+			expected = antigravityCodeRedirectURI
+		}
+		if originPath != expected {
+			return "", errors.New("回调 URL 与当前登录会话不匹配，请使用本次生成的 Google 登录链接")
+		}
+		q := u.Query()
+		if len(q["state"]) != 1 || (pendingState != "" && q.Get("state") != pendingState) {
+			return "", errors.New("回调 URL 的 state 与当前登录会话不匹配，请重新生成登录链接")
+		}
+		if errVals := q["error"]; len(errVals) > 0 && strings.TrimSpace(errVals[0]) != "" {
+			return "", fmt.Errorf("Google 登录未获批准 (%s)", strings.TrimSpace(errVals[0]))
+		}
+		if len(q["code"]) != 1 || strings.TrimSpace(q.Get("code")) == "" {
+			return "", errors.New("回调 URL 中缺少有效的授权码 code 参数")
+		}
+		return v, nil
+	}
+	if strings.Contains(v, "code=") || strings.Contains(v, "&") || strings.Contains(v, "?") {
+		return "", errors.New("请粘贴完整回调 URL (https://...) 或页面显示的纯授权码")
+	}
+	if len(v) < 4 || len(v) > 2048 || !validRawAuthCodeRe.MatchString(v) {
+		return "", errors.New("授权码格式无效，请检查是否完整复制了 Antigravity 页面上的授权码")
+	}
+	return v, nil
 }
 
 func extractAuthCodeFromInput(raw string) string {
@@ -531,77 +522,555 @@ func extractAuthCodeFromInput(raw string) string {
 	return s
 }
 
-// SubmitOAuthCode feeds the user's authorization code into the waiting agy login session and verifies token creation.
-func (am *AccountManager) SubmitOAuthCode(accountID, rawCode string) (tierLabel string, modelsCount int, err error) {
+// StartOAuthLogin spawns `agy acp --gemini-dir <dir> --app-data-dir antigravity-cli --login`
+// and returns the Google OAuth URL.
+func (am *AccountManager) StartOAuthLogin(accountID string) (string, error) {
+	snap, err := am.StartOAuthLoginFlow(accountID)
+	if err != nil {
+		return "", err
+	}
+	return snap.AuthorizationURL, nil
+}
+
+// StartOAuthLoginFlow launches T3-style `agy acp ... --login` inside an isolated staging
+// directory so existing live credentials and workers stay untouched until the new login is verified.
+func (am *AccountManager) StartOAuthLoginFlow(accountID string) (OAuthFlowSnapshot, error) {
 	accountID = strings.ToLower(strings.TrimSpace(accountID))
 	acc, ok := am.GetAccount(accountID)
 	if !ok {
-		return "", 0, fmt.Errorf("未找到账号 %q", accountID)
-	}
-	code := extractAuthCodeFromInput(rawCode)
-	if code == "" {
-		return "", 0, errors.New("授权码不能为空")
+		return OAuthFlowSnapshot{}, fmt.Errorf("未找到账号 %q", accountID)
 	}
 
+	var prevSess *pendingOAuthSession
+	flowID := newOAuthFlowID()
+	meta := am.ReadAccountTokenMeta(acc.ID)
 	am.oauthMu.Lock()
-	sess := am.oauthActive[acc.ID]
-	delete(am.oauthActive, acc.ID)
-	am.oauthMu.Unlock()
-	if sess == nil {
-		return "", 0, errors.New("当前无进行中的 OAuth 授权会话，请先点击“获取 Google 授权链接”")
+	am.ensureOAuthMapsLocked()
+	if old, exists := am.oauthActive[acc.ID]; exists && old != nil {
+		prevSess = old
+		am.cancelOAuthSessionLocked(old)
 	}
-	defer func() {
-		if sess.stdin != nil {
-			_ = sess.stdin.Close()
-		}
-	}()
+	am.recordOAuthSnapshotLocked(OAuthFlowSnapshot{
+		AccountID:     acc.ID,
+		Phase:         "starting",
+		FlowID:        flowID,
+		Mode:          "acp_code",
+		Message:       "正在通过该账号代理启动 agy acp OAuth 握手...",
+		Authenticated: meta.Authenticated,
+		Email:         meta.Email,
+	})
+	am.oauthMu.Unlock()
+
+	if prevSess != nil {
+		waitOAuthProcExit(prevSess, 3*time.Second)
+		cleanupOAuthSessionArtifacts(prevSess)
+	}
+
+	tokPath := am.AccountTokenPath(acc.ID)
+	tempDir, err := os.MkdirTemp("", "agy-oauth-login-*")
+	if err != nil {
+		return OAuthFlowSnapshot{}, err
+	}
+	stagingGeminiDir := filepath.Join(tempDir, "gemini")
+	stagingTokPath := filepath.Join(stagingGeminiDir, "antigravity-cli", "antigravity-oauth-token")
+	if err := os.MkdirAll(filepath.Dir(stagingTokPath), 0o700); err != nil {
+		_ = os.RemoveAll(tempDir)
+		return OAuthFlowSnapshot{}, err
+	}
 
 	proxy := am.ResolveAccountProxy(acc)
-	_, _ = io.WriteString(sess.stdin, code+"\n")
+	cmd := exec.Command(PatchedAgyBin, "acp", "--gemini-dir", stagingGeminiDir, "--app-data-dir", "antigravity-cli", "--login")
+	cmd.Dir = tempDir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = oauthSubprocessEnv(tempDir, stagingGeminiDir, proxy)
 
-	// Wait up to 25s for token exchange to write antigravity-oauth-token
-	deadline := time.Now().Add(25 * time.Second)
-waitLoop:
-	for time.Now().Before(deadline) {
-		am.InvalidateTokenCache(acc.ID)
-		if am.HasOAuthToken(acc.ID) {
-			break waitLoop
-		}
-		select {
-		case <-sess.done:
-			break waitLoop
-		case <-time.After(150 * time.Millisecond):
+	failStart := func(msg string) {
+		_ = os.RemoveAll(tempDir)
+		curMeta := am.ReadAccountTokenMeta(acc.ID)
+		am.oauthMu.Lock()
+		am.recordOAuthSnapshotLocked(OAuthFlowSnapshot{
+			AccountID:     acc.ID,
+			Phase:         "failed",
+			FlowID:        flowID,
+			Mode:          "acp_code",
+			Message:       msg,
+			Email:         curMeta.Email,
+			Authenticated: curMeta.Authenticated,
+		})
+		am.oauthMu.Unlock()
+	}
+
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		failStart(err.Error())
+		return OAuthFlowSnapshot{}, err
+	}
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdinPipe.Close()
+		failStart(err.Error())
+		return OAuthFlowSnapshot{}, err
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		_ = stdinPipe.Close()
+		_ = stdoutPipe.Close()
+		failStart(err.Error())
+		return OAuthFlowSnapshot{}, err
+	}
+
+	if err := cmd.Start(); err != nil {
+		_ = stdinPipe.Close()
+		failStart(err.Error())
+		return OAuthFlowSnapshot{}, err
+	}
+
+	sess := &pendingOAuthSession{
+		accountID:        acc.ID,
+		flowID:           flowID,
+		tempDir:          tempDir,
+		stagingGeminiDir: stagingGeminiDir,
+		stagingTokPath:   stagingTokPath,
+		cmd:              cmd,
+		stdin:            stdinPipe,
+		output:           &bytes.Buffer{},
+		tokenPath:        tokPath,
+		startedAt:        time.Now(),
+		done:             make(chan struct{}),
+		doneCh:           make(chan error, 1),
+	}
+
+	urlCh := make(chan string, 1)
+	var urlOnce sync.Once
+	scanPipe := func(r io.Reader) {
+		sc := bufio.NewScanner(r)
+		sc.Buffer(make([]byte, 64*1024), 512*1024)
+		for sc.Scan() {
+			line := sc.Text()
+			sess.outMu.Lock()
+			if sess.output.Len() < 64*1024 {
+				sess.output.WriteString(line + "\n")
+			}
+			sess.outMu.Unlock()
+			if m := oauthURLRe.FindString(line); m != "" {
+				urlOnce.Do(func() {
+					urlCh <- m
+				})
+			}
 		}
 	}
-	terminateOAuthProcGroup(sess)
 
-	am.InvalidateTokenCache(acc.ID)
-	if !am.HasOAuthToken(acc.ID) {
-		if sess.bakPath != "" && fileExists(sess.bakPath) {
-			_ = os.Rename(sess.bakPath, sess.tokenPath)
-			am.InvalidateTokenCache(acc.ID)
+	var ioWG sync.WaitGroup
+	ioWG.Add(2)
+	go func() {
+		defer ioWG.Done()
+		scanPipe(stdoutPipe)
+	}()
+	go func() {
+		defer ioWG.Done()
+		scanPipe(stderrPipe)
+	}()
+	go func() {
+		ioWG.Wait()
+		waitErr := cmd.Wait()
+		sess.doneCh <- waitErr
+		close(sess.done)
+	}()
+
+	select {
+	case rawAuthURL := <-urlCh:
+		authURL, redirectURI, state, valErr := parseAntigravityCodeAuthURL(rawAuthURL)
+		if valErr != nil {
+			_ = stdinPipe.Close()
+			terminateOAuthProcGroup(sess)
+			waitOAuthProcExit(sess, 3*time.Second)
+			failStart(valErr.Error())
+			return OAuthFlowSnapshot{}, valErr
 		}
+		expiresAt := time.Now().Add(oauthSessionTTL)
+		sess.authURL = authURL
+		sess.redirectURI = redirectURI
+		sess.state = state
+		sess.expiresAt = expiresAt
+
+		curMeta := am.ReadAccountTokenMeta(acc.ID)
+		snap := OAuthFlowSnapshot{
+			AccountID:        acc.ID,
+			Phase:            "waiting",
+			FlowID:           flowID,
+			Mode:             "acp_code",
+			AuthorizationURL: authURL,
+			ExpiresAt:        expiresAt.UTC().Format(time.RFC3339),
+			Message:          "请打开 Google 登录页完成授权，再将页面显示的授权码或完整回调 URL 粘贴到下方完成验证",
+			Email:            curMeta.Email,
+			Authenticated:    curMeta.Authenticated,
+		}
+
+		var replaced *pendingOAuthSession
+		am.oauthMu.Lock()
+		am.ensureOAuthMapsLocked()
+		if old, exists := am.oauthActive[acc.ID]; exists && old != nil && old != sess {
+			replaced = old
+			am.cancelOAuthSessionLocked(old)
+		}
+		am.oauthActive[acc.ID] = sess
+		am.recordOAuthSnapshotLocked(snap)
+		am.oauthMu.Unlock()
+		if replaced != nil {
+			waitOAuthProcExit(replaced, 2*time.Second)
+			cleanupOAuthSessionArtifacts(replaced)
+		}
+
+		go func(s *pendingOAuthSession) {
+			ttl := time.Until(s.expiresAt)
+			if ttl <= 0 {
+				ttl = time.Millisecond
+			}
+			timer := time.NewTimer(ttl)
+			defer timer.Stop()
+			select {
+			case <-s.done:
+				am.oauthMu.Lock()
+				cur := am.oauthActive[s.accountID]
+				if cur != s || s.submitted {
+					am.oauthMu.Unlock()
+					return
+				}
+				am.cancelOAuthSessionLocked(s)
+				liveMeta := am.ReadAccountTokenMeta(s.accountID)
+				am.recordOAuthSnapshotLocked(OAuthFlowSnapshot{
+					AccountID:     s.accountID,
+					Phase:         "failed",
+					FlowID:        s.flowID,
+					Mode:          "acp_code",
+					Message:       "agy acp 登录进程提前退出，请重新生成 Google 登录链接",
+					Email:         liveMeta.Email,
+					Authenticated: liveMeta.Authenticated,
+				})
+				am.oauthMu.Unlock()
+				cleanupOAuthSessionArtifacts(s)
+			case <-timer.C:
+				am.oauthMu.Lock()
+				cur := am.oauthActive[s.accountID]
+				if cur != s || s.submitted {
+					am.oauthMu.Unlock()
+					return
+				}
+				am.cancelOAuthSessionLocked(s)
+				liveMeta := am.ReadAccountTokenMeta(s.accountID)
+				am.recordOAuthSnapshotLocked(OAuthFlowSnapshot{
+					AccountID:     s.accountID,
+					Phase:         "failed",
+					FlowID:        s.flowID,
+					Mode:          "acp_code",
+					Message:       "Google 登录链接已超时，请重新生成授权链接",
+					Email:         liveMeta.Email,
+					Authenticated: liveMeta.Authenticated,
+				})
+				am.oauthMu.Unlock()
+				waitOAuthProcExit(s, 3*time.Second)
+				cleanupOAuthSessionArtifacts(s)
+			}
+		}(sess)
+
+		return snap, nil
+
+	case waitErr := <-sess.doneCh:
+		_ = stdinPipe.Close()
+		<-sess.done
 		sess.outMu.Lock()
 		outStr := strings.TrimSpace(sess.output.String())
 		sess.outMu.Unlock()
-		return "", 0, fmt.Errorf("OAuth 换取凭据未成功: %s", redactAccountErrorString(truncateRunes(outStr, 240), proxy))
+		errMsg := fmt.Sprintf("未能获取 OAuth 授权链接 (%v): %s", waitErr, redactAccountErrorString(truncateRunes(outStr, 200), proxy))
+		failStart(errMsg)
+		return OAuthFlowSnapshot{}, errors.New(errMsg)
+
+	case <-time.After(oauthStartTimeout):
+		_ = stdinPipe.Close()
+		terminateOAuthProcGroup(sess)
+		waitOAuthProcExit(sess, 3*time.Second)
+		errMsg := fmt.Sprintf("启动 agy acp OAuth 握手超时 (%s)", oauthStartTimeout)
+		failStart(errMsg)
+		return OAuthFlowSnapshot{}, errors.New(errMsg)
+	}
+}
+
+// CancelOAuthLogin aborts any active OAuth handshake for accountID without touching live credentials.
+func (am *AccountManager) CancelOAuthLogin(accountID, flowID string) (OAuthFlowSnapshot, error) {
+	accountID = strings.ToLower(strings.TrimSpace(accountID))
+	acc, ok := am.GetAccount(accountID)
+	if !ok {
+		return OAuthFlowSnapshot{}, fmt.Errorf("未找到账号 %q", accountID)
+	}
+	var sess *pendingOAuthSession
+	am.oauthMu.Lock()
+	am.ensureOAuthMapsLocked()
+	if cur := am.oauthActive[acc.ID]; cur != nil && (flowID == "" || cur.flowID == flowID) {
+		sess = cur
+		am.cancelOAuthSessionLocked(cur)
+	}
+	am.oauthMu.Unlock()
+
+	if sess != nil {
+		waitOAuthProcExit(sess, 3*time.Second)
+		cleanupOAuthSessionArtifacts(sess)
+	}
+	meta := am.ReadAccountTokenMeta(acc.ID)
+	snap := OAuthFlowSnapshot{
+		AccountID:     acc.ID,
+		Phase:         "cancelled",
+		FlowID:        flowID,
+		Mode:          "acp_code",
+		Message:       "已取消本次 Google 登录",
+		Email:         meta.Email,
+		Authenticated: meta.Authenticated,
+	}
+	am.oauthMu.Lock()
+	am.recordOAuthSnapshotLocked(snap)
+	am.oauthMu.Unlock()
+	return snap, nil
+}
+
+// GetOAuthStatus returns the current OAuth flow state and persisted credential metadata for accountID.
+func (am *AccountManager) GetOAuthStatus(accountID string) (OAuthFlowSnapshot, error) {
+	accountID = strings.ToLower(strings.TrimSpace(accountID))
+	acc, ok := am.GetAccount(accountID)
+	if !ok {
+		return OAuthFlowSnapshot{}, fmt.Errorf("未找到账号 %q", accountID)
+	}
+	meta := am.ReadAccountTokenMeta(acc.ID)
+	am.oauthMu.Lock()
+	am.ensureOAuthMapsLocked()
+	snap, exists := am.oauthState[acc.ID]
+	active := am.oauthActive[acc.ID]
+	if active != nil && active.expiresAt.After(time.Now()) && !active.submitted {
+		snap = OAuthFlowSnapshot{
+			AccountID:        acc.ID,
+			Phase:            "waiting",
+			FlowID:           active.flowID,
+			Mode:             "acp_code",
+			AuthorizationURL: active.authURL,
+			ExpiresAt:        active.expiresAt.UTC().Format(time.RFC3339),
+			Message:          "请打开 Google 登录页完成授权，再将页面显示的授权码或完整回调 URL 粘贴到下方完成验证",
+			Email:            meta.Email,
+			Authenticated:    meta.Authenticated,
+		}
+	} else if !exists {
+		snap = OAuthFlowSnapshot{
+			AccountID:     acc.ID,
+			Phase:         "idle",
+			Mode:          "acp_code",
+			Email:         meta.Email,
+			Authenticated: meta.Authenticated,
+		}
+	} else {
+		snap.Authenticated = meta.Authenticated
+		if meta.Email != "" {
+			snap.Email = meta.Email
+		} else if !meta.Authenticated {
+			snap.Email = ""
+		}
+	}
+	am.oauthMu.Unlock()
+	return snap, nil
+}
+
+// SubmitOAuthCode feeds the user's authorization code into the waiting agy login session and verifies token creation.
+func (am *AccountManager) SubmitOAuthCode(accountID, rawCode string) (tierLabel string, modelsCount int, err error) {
+	snap, err := am.SubmitOAuthCodeFlow(accountID, "", rawCode)
+	if err != nil {
+		return "", 0, err
+	}
+	return snap.Tier, snap.ModelsCount, nil
+}
+
+// SubmitOAuthCodeFlow validates the pasted code/URL against the active flow's state and redirect_uri,
+// exchanges it via `agy acp --login`, verifies the resulting credential via ACP `authenticate`, and
+// reloads the target runtime.
+func (am *AccountManager) SubmitOAuthCodeFlow(accountID, flowID, rawInput string) (OAuthFlowSnapshot, error) {
+	accountID = strings.ToLower(strings.TrimSpace(accountID))
+	acc, ok := am.GetAccount(accountID)
+	if !ok {
+		return OAuthFlowSnapshot{}, fmt.Errorf("未找到账号 %q", accountID)
 	}
 
-	_ = os.Chmod(sess.tokenPath, 0o600)
-	if sess.bakPath != "" {
-		_ = os.Remove(sess.bakPath)
+	am.oauthMu.Lock()
+	am.ensureOAuthMapsLocked()
+	sess := am.oauthActive[acc.ID]
+	if sess == nil {
+		am.oauthMu.Unlock()
+		return OAuthFlowSnapshot{}, errors.New("当前无进行中的 OAuth 登录会话，请先生成 Google 授权链接")
 	}
+	if flowID != "" && sess.flowID != flowID {
+		am.oauthMu.Unlock()
+		return OAuthFlowSnapshot{}, errors.New("登录会话已过期或已被新会话替换，请重新生成 Google 授权链接")
+	}
+	if !sess.expiresAt.IsZero() && time.Now().After(sess.expiresAt) {
+		am.cancelOAuthSessionLocked(sess)
+		liveMeta := am.ReadAccountTokenMeta(acc.ID)
+		am.recordOAuthSnapshotLocked(OAuthFlowSnapshot{
+			AccountID:     acc.ID,
+			Phase:         "failed",
+			FlowID:        sess.flowID,
+			Mode:          "acp_code",
+			Message:       "Google 登录链接已过期，请重新生成授权链接",
+			Authenticated: liveMeta.Authenticated,
+			Email:         liveMeta.Email,
+		})
+		am.oauthMu.Unlock()
+		waitOAuthProcExit(sess, 3*time.Second)
+		cleanupOAuthSessionArtifacts(sess)
+		return OAuthFlowSnapshot{}, errors.New("Google 登录链接已过期，请重新生成授权链接")
+	}
+	if sess.submitted {
+		am.oauthMu.Unlock()
+		return OAuthFlowSnapshot{}, errors.New("授权码已提交，正在等待 Google 验证完成")
+	}
+
+	validated, valErr := validateAntigravityLoginResponse(sess.redirectURI, sess.state, rawInput)
+	if valErr != nil {
+		// Keep sess active so the user can fix a typo or wrong-tab URL without starting over.
+		am.oauthMu.Unlock()
+		return OAuthFlowSnapshot{}, valErr
+	}
+
+	sess.submitted = true
+	liveMeta := am.ReadAccountTokenMeta(acc.ID)
+	am.recordOAuthSnapshotLocked(OAuthFlowSnapshot{
+		AccountID:     acc.ID,
+		Phase:         "verifying",
+		FlowID:        sess.flowID,
+		Mode:          "acp_code",
+		Message:       "正在经该账号专属代理向 Google 换取凭据并校验 Antigravity 访问权限...",
+		Authenticated: liveMeta.Authenticated,
+		Email:         liveMeta.Email,
+	})
+	am.oauthMu.Unlock()
+
+	proxy := am.ResolveAccountProxy(acc)
+	_, writeErr := io.WriteString(sess.stdin, validated+"\n")
+	if sess.stdin != nil {
+		_ = sess.stdin.Close()
+	}
+
+	var waitErr error
+	timedOut := false
+	if writeErr != nil {
+		waitErr = writeErr
+		terminateOAuthProcGroup(sess)
+		waitOAuthProcExit(sess, 3*time.Second)
+	} else {
+		timer := time.NewTimer(oauthSubmitTimeout)
+		select {
+		case waitErr = <-sess.doneCh:
+			timer.Stop()
+			<-sess.done
+		case <-timer.C:
+			timedOut = true
+			terminateOAuthProcGroup(sess)
+			waitOAuthProcExit(sess, 3*time.Second)
+		}
+	}
+
+	am.oauthMu.Lock()
+	if am.oauthActive[acc.ID] == sess {
+		delete(am.oauthActive, acc.ID)
+	}
+	am.oauthMu.Unlock()
+	defer cleanupOAuthSessionArtifacts(sess)
+
+	failStaging := func(errMsg string) (OAuthFlowSnapshot, error) {
+		curMeta := am.ReadAccountTokenMeta(acc.ID)
+		snap := OAuthFlowSnapshot{
+			AccountID:     acc.ID,
+			Phase:         "failed",
+			FlowID:        sess.flowID,
+			Mode:          "acp_code",
+			Message:       errMsg,
+			Email:         curMeta.Email,
+			Authenticated: curMeta.Authenticated,
+		}
+		am.oauthMu.Lock()
+		am.recordOAuthSnapshotLocked(snap)
+		am.oauthMu.Unlock()
+		return OAuthFlowSnapshot{}, errors.New(errMsg)
+	}
+
+	if timedOut {
+		return failStaging(fmt.Sprintf("向 Google 换取凭据超时 (%s)，请检查代理连通性后重试", oauthSubmitTimeout))
+	}
+	stInfo, statErr := os.Stat(sess.stagingTokPath)
+	if waitErr != nil || statErr != nil || stInfo.IsDir() || stInfo.Size() <= 16 {
+		sess.outMu.Lock()
+		outStr := strings.TrimSpace(sess.output.String())
+		sess.outMu.Unlock()
+		detail := redactAccountErrorString(truncateRunes(outStr, 240), proxy)
+		if detail == "" && waitErr != nil {
+			detail = redactAccountErrorString(waitErr.Error(), proxy)
+		}
+		return failStaging(fmt.Sprintf("OAuth 换取凭据未成功: %s", detail))
+	}
+	_ = os.Chmod(sess.stagingTokPath, 0o600)
+	stagingTokBytes, readErr := os.ReadFile(sess.stagingTokPath)
+	if readErr != nil || len(bytes.TrimSpace(stagingTokBytes)) <= 16 {
+		return failStaging("未能读取暂存的 OAuth 凭据文件")
+	}
+
+	tier, cnt, verErr := am.verifyAccountViaACPInDir(acc, sess.tempDir, sess.stagingGeminiDir)
+	if verErr != nil {
+		return failStaging(verErr.Error())
+	}
+
+	if !acc.Primary {
+		am.StopAccountWorker(acc.ID)
+	}
+	if err := os.MkdirAll(filepath.Dir(sess.tokenPath), 0o700); err != nil {
+		return failStaging(err.Error())
+	}
+	tmpTok := sess.tokenPath + ".tmp"
+	if err := os.WriteFile(tmpTok, stagingTokBytes, 0o600); err != nil {
+		return failStaging(err.Error())
+	}
+	if err := os.Rename(tmpTok, sess.tokenPath); err != nil {
+		_ = os.Remove(tmpTok)
+		return failStaging(err.Error())
+	}
+	_ = os.Chmod(sess.tokenPath, 0o600)
+	_ = os.Remove(sess.tokenPath + ".oauth-bak")
+	_ = os.Remove(filepath.Join(filepath.Dir(sess.tokenPath), "acp_token.json"))
 	am.InvalidateTokenCache(acc.ID)
 
-	tier, cnt := am.probeAccountModelsTier(acc)
-	if !acc.Primary && acc.Enabled {
+	meta := am.ReadAccountTokenMeta(acc.ID)
+	am.ClearStickyForAccount(acc.ID)
+	if acc.Primary {
+		if !testing.Testing() {
+			GlobalEngine.StopEngine()
+		}
+		resetPrimaryQuotaCache()
+	} else if acc.Enabled {
 		_ = am.EnsureAccountWorkerRunning(acc.ID)
 	}
 	resetPeerDashboardCacheForTest()
-	return tier, cnt, nil
+
+	snap := OAuthFlowSnapshot{
+		AccountID:     acc.ID,
+		Phase:         "succeeded",
+		FlowID:        sess.flowID,
+		Mode:          "acp_code",
+		Message:       "Google 登录并验证成功",
+		Email:         meta.Email,
+		Tier:          tier,
+		ModelsCount:   cnt,
+		Authenticated: true,
+	}
+	am.oauthMu.Lock()
+	am.recordOAuthSnapshotLocked(snap)
+	am.oauthMu.Unlock()
+	return snap, nil
 }
 
-// ImportOAuthToken writes a pasted antigravity-oauth-token file content directly into the account's isolated directory.
+// ImportOAuthToken verifies a pasted antigravity-oauth-token in a staging directory first,
+// then atomically installs it into the account's isolated directory and reloads the runtime.
 func (am *AccountManager) ImportOAuthToken(accountID, rawToken string) (tierLabel string, modelsCount int, err error) {
 	accountID = strings.ToLower(strings.TrimSpace(accountID))
 	acc, ok := am.GetAccount(accountID)
@@ -612,10 +1081,31 @@ func (am *AccountManager) ImportOAuthToken(accountID, rawToken string) (tierLabe
 	if len(trimmed) < 20 {
 		return "", 0, errors.New("凭据内容过短，请粘贴完整的 antigravity-oauth-token / jetski-standalone-oauth-token 文件内容")
 	}
+
+	stageDir, err := os.MkdirTemp("", "agy-oauth-import-*")
+	if err != nil {
+		return "", 0, err
+	}
+	defer func() {
+		_ = os.RemoveAll(stageDir)
+	}()
+	stageGem := filepath.Join(stageDir, "gemini")
+	stageTok := filepath.Join(stageGem, "antigravity-cli", "antigravity-oauth-token")
+	if err := os.MkdirAll(filepath.Dir(stageTok), 0o700); err != nil {
+		return "", 0, err
+	}
+	if err := os.WriteFile(stageTok, []byte(trimmed+"\n"), 0o600); err != nil {
+		return "", 0, err
+	}
+
+	tier, cnt, verErr := am.verifyAccountViaACPInDir(acc, stageDir, stageGem)
+	if verErr != nil {
+		return "", 0, verErr
+	}
+
 	if !acc.Primary {
 		am.StopAccountWorker(acc.ID)
 	}
-
 	tokPath := am.AccountTokenPath(acc.ID)
 	if err := os.MkdirAll(filepath.Dir(tokPath), 0o700); err != nil {
 		return "", 0, err
@@ -625,55 +1115,420 @@ func (am *AccountManager) ImportOAuthToken(accountID, rawToken string) (tierLabe
 		return "", 0, err
 	}
 	if err := os.Rename(tmp, tokPath); err != nil {
+		_ = os.Remove(tmp)
 		return "", 0, err
 	}
+	_ = os.Remove(tokPath + ".oauth-bak")
+	_ = os.Remove(filepath.Join(filepath.Dir(tokPath), "acp_token.json"))
 	am.InvalidateTokenCache(acc.ID)
 
-	tier, cnt := am.probeAccountModelsTier(acc)
-	if !acc.Primary && acc.Enabled {
+	meta := am.ReadAccountTokenMeta(acc.ID)
+	am.ClearStickyForAccount(acc.ID)
+	if acc.Primary {
+		if !testing.Testing() {
+			GlobalEngine.StopEngine()
+		}
+		resetPrimaryQuotaCache()
+	} else if acc.Enabled {
 		_ = am.EnsureAccountWorkerRunning(acc.ID)
 	}
 	resetPeerDashboardCacheForTest()
+
+	am.oauthMu.Lock()
+	am.recordOAuthSnapshotLocked(OAuthFlowSnapshot{
+		AccountID:     acc.ID,
+		Phase:         "succeeded",
+		Mode:          "import",
+		Message:       "凭据导入并验证成功",
+		Email:         meta.Email,
+		Tier:          tier,
+		ModelsCount:   cnt,
+		Authenticated: true,
+	})
+	am.oauthMu.Unlock()
 	return tier, cnt, nil
 }
 
-func (am *AccountManager) probeAccountModelsTier(acc AccountProfile) (tierLabel string, modelsCount int) {
-	if testing.Testing() {
-		return "测试环境已验证", 0
+// LogoutAccount revokes/removes the account's saved OAuth credentials and stops its active runtime.
+func (am *AccountManager) LogoutAccount(accountID string) error {
+	accountID = strings.ToLower(strings.TrimSpace(accountID))
+	acc, ok := am.GetAccount(accountID)
+	if !ok {
+		return fmt.Errorf("未找到账号 %q", accountID)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	homeDir := am.AccountHomeDir(acc.ID)
+
+	var oldSess *pendingOAuthSession
+	am.oauthMu.Lock()
+	am.ensureOAuthMapsLocked()
+	if cur := am.oauthActive[acc.ID]; cur != nil {
+		oldSess = cur
+		am.cancelOAuthSessionLocked(cur)
+	}
+	am.oauthMu.Unlock()
+	if oldSess != nil {
+		waitOAuthProcExit(oldSess, 3*time.Second)
+		cleanupOAuthSessionArtifacts(oldSess)
+	}
+
+	if acc.Primary {
+		if !testing.Testing() {
+			GlobalEngine.StopEngine()
+		}
+	} else {
+		am.StopAccountWorker(acc.ID)
+	}
+
+	_ = am.logoutAccountViaACP(acc)
+
+	tokPath := am.AccountTokenPath(acc.ID)
+	_ = os.Remove(tokPath)
+	_ = os.Remove(tokPath + ".oauth-bak")
+	_ = os.Remove(filepath.Join(filepath.Dir(tokPath), "acp_token.json"))
+	am.InvalidateTokenCache(acc.ID)
+	am.ClearStickyForAccount(acc.ID)
+	if acc.Primary {
+		resetPrimaryQuotaCache()
+	}
+	resetPeerDashboardCacheForTest()
+
+	am.oauthMu.Lock()
+	am.recordOAuthSnapshotLocked(OAuthFlowSnapshot{
+		AccountID:     acc.ID,
+		Phase:         "idle",
+		Mode:          "acp_code",
+		Message:       "已退出 Google 登录",
+		Authenticated: false,
+	})
+	am.oauthMu.Unlock()
+	return nil
+}
+
+func stopDisposableACPProcess(cmd *exec.Cmd, stdin io.WriteCloser, done <-chan struct{}) {
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	pid := cmd.Process.Pid
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
+	if done != nil {
+		timer := time.NewTimer(600 * time.Millisecond)
+		select {
+		case <-done:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+	if done != nil {
+		<-done
+	}
+}
+
+func (am *AccountManager) verifyAccountViaACP(acc AccountProfile) (tierLabel string, modelsCount int, err error) {
+	return am.verifyAccountViaACPInDir(acc, am.AccountHomeDir(acc.ID), am.AccountGeminiDir(acc.ID))
+}
+
+func (am *AccountManager) verifyAccountViaACPInDir(acc AccountProfile, homeDir, geminiDir string) (tierLabel string, modelsCount int, err error) {
+	if testing.Testing() && !oauthVerifyInTest {
+		return "测试环境已验证", 0, nil
+	}
+
 	proxy := am.ResolveAccountProxy(acc)
-	cmd := exec.CommandContext(ctx, PatchedAgyBin, "models")
-	cmd.Dir = homeDir
-	env := make([]string, 0, len(os.Environ())+6)
-	for _, kv := range os.Environ() {
-		if isStrippedSubprocessEnv(kv) {
-			continue
-		}
-		env = append(env, kv)
-	}
-	env = append(env, "HOME="+homeDir, "HTTP_PROXY="+proxy, "HTTPS_PROXY="+proxy, "NO_PROXY=127.0.0.1,localhost,::1", "no_proxy=127.0.0.1,localhost,::1")
-	cmd.Env = env
-	out, err := cmd.CombinedOutput()
+
+	verifyDir, err := os.MkdirTemp("", "agy-acp-verify-*")
 	if err != nil {
-		return "已写入凭据", 0
+		return "", 0, err
 	}
-	s := string(out)
-	for _, line := range strings.Split(s, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "gemini-") || strings.HasPrefix(line, "claude-") || strings.HasPrefix(line, "gpt-") {
-			modelsCount++
+	defer func() {
+		_ = os.RemoveAll(verifyDir)
+	}()
+
+	cmd := exec.Command(PatchedAgyBin, "acp", "--gemini-dir", geminiDir, "--app-data-dir", "antigravity-cli", "--disable-telemetry")
+	cmd.Dir = verifyDir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = oauthSubprocessEnv(homeDir, geminiDir, proxy)
+
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		return "", 0, err
+	}
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdinPipe.Close()
+		return "", 0, err
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		_ = stdinPipe.Close()
+		_ = stdoutPipe.Close()
+		return "", 0, err
+	}
+	if err := cmd.Start(); err != nil {
+		_ = stdinPipe.Close()
+		return "", 0, err
+	}
+
+	type rpcMsg struct {
+		ID     int             `json:"id"`
+		Result json.RawMessage `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+
+	msgCh := make(chan rpcMsg, 8)
+	done := make(chan struct{})
+	var errBuf bytes.Buffer
+	var errMu sync.Mutex
+	var ioWG sync.WaitGroup
+	ioWG.Add(2)
+	go func() {
+		defer ioWG.Done()
+		sc := bufio.NewScanner(stdoutPipe)
+		sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		for sc.Scan() {
+			line := bytes.TrimSpace(sc.Bytes())
+			if len(line) == 0 || line[0] != '{' {
+				continue
+			}
+			var m rpcMsg
+			if json.Unmarshal(line, &m) == nil && m.ID > 0 {
+				msgCh <- m
+			}
+		}
+	}()
+	go func() {
+		defer ioWG.Done()
+		sc := bufio.NewScanner(stderrPipe)
+		sc.Buffer(make([]byte, 32*1024), 256*1024)
+		for sc.Scan() {
+			errMu.Lock()
+			if errBuf.Len() < 8192 {
+				errBuf.WriteString(sc.Text() + "\n")
+			}
+			errMu.Unlock()
+		}
+	}()
+	go func() {
+		ioWG.Wait()
+		_ = cmd.Wait()
+		close(done)
+	}()
+
+	defer stopDisposableACPProcess(cmd, stdinPipe, done)
+
+	initReq := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params": map[string]any{
+			"protocolVersion": 1,
+			"clientCapabilities": map[string]any{
+				"fs":       map[string]any{"readTextFile": false, "writeTextFile": false},
+				"terminal": false,
+			},
+			"clientInfo": map[string]any{"name": "antigravity", "version": detectAgySemver(PatchedAgyBin)},
+		},
+	}
+	authReq := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "authenticate",
+		"params":  map[string]any{"methodId": "oauth-personal"},
+	}
+	b1, _ := json.Marshal(initReq)
+	b2, _ := json.Marshal(authReq)
+	if _, err := stdinPipe.Write(append(append(b1, '\n'), append(b2, '\n')...)); err != nil {
+		return "", 0, err
+	}
+
+	timer := time.NewTimer(oauthVerifyTimeout)
+	defer timer.Stop()
+	for {
+		select {
+		case m := <-msgCh:
+			if m.ID == 1 {
+				if m.Error != nil {
+					return "", 0, fmt.Errorf("Antigravity ACP 初始化失败: %s", redactAccountErrorString(truncateRunes(m.Error.Message, 200), proxy))
+				}
+				continue
+			}
+			if m.ID == 2 {
+				if m.Error != nil {
+					em := m.Error.Message
+					low := strings.ToLower(em)
+					switch {
+					case strings.Contains(em, "SUBSCRIPTION_REQUIRED"):
+						return "", 0, errors.New("该 Google 账号尚未开通有效的 Antigravity 订阅资格")
+					case strings.Contains(low, "access_denied") || strings.Contains(low, "denied access") || strings.Contains(low, "cancelled"):
+						return "", 0, errors.New("Google 登录授权未批准，请重新登录")
+					case strings.Contains(em, "No browser is available"):
+						return "", 0, errors.New("凭据未被 Antigravity 接受或已失效，请重新完成 Google 登录")
+					default:
+						return "", 0, fmt.Errorf("Antigravity 验证失败: %s", redactAccountErrorString(truncateRunes(em, 200), proxy))
+					}
+				}
+				var authRes struct {
+					Meta *struct {
+						Antigravity *struct {
+							Tier *struct {
+								Name string `json:"name"`
+								ID   string `json:"id"`
+							} `json:"tier"`
+						} `json:"antigravity"`
+					} `json:"_meta"`
+				}
+				tier := ""
+				if json.Unmarshal(m.Result, &authRes) == nil && authRes.Meta != nil && authRes.Meta.Antigravity != nil && authRes.Meta.Antigravity.Tier != nil {
+					tier = strings.TrimSpace(authRes.Meta.Antigravity.Tier.Name)
+				}
+				if tier == "" {
+					tier = "Google 账号已验证"
+				}
+				return tier, 0, nil
+			}
+		case <-done:
+			errMu.Lock()
+			es := strings.TrimSpace(errBuf.String())
+			errMu.Unlock()
+			if es == "" {
+				es = "agy acp 验证进程意外退出"
+			}
+			return "", 0, fmt.Errorf("Antigravity 验证未完成: %s", redactAccountErrorString(truncateRunes(es, 200), proxy))
+		case <-timer.C:
+			return "", 0, fmt.Errorf("Antigravity 凭据验证超时 (%s)，请检查代理连通性", oauthVerifyTimeout)
 		}
 	}
-	if strings.Contains(s, "gemini-pro-orchestrator-g1-pro") {
-		return fmt.Sprintf("Google One AI Pro (%d 款模型)", modelsCount), modelsCount
+}
+
+func (am *AccountManager) logoutAccountViaACP(acc AccountProfile) error {
+	if testing.Testing() && !oauthVerifyInTest {
+		return nil
 	}
-	if strings.Contains(s, "gemini-4-carbon") {
-		return fmt.Sprintf("20x / Ultra 池 (%d 款模型)", modelsCount), modelsCount
+	homeDir := am.AccountHomeDir(acc.ID)
+	geminiDir := am.AccountGeminiDir(acc.ID)
+	proxy := am.ResolveAccountProxy(acc)
+
+	tmpDir, err := os.MkdirTemp("", "agy-acp-logout-*")
+	if err != nil {
+		return err
 	}
-	return fmt.Sprintf("已验证 (%d 款模型)", modelsCount), modelsCount
+	defer func() {
+		_ = os.RemoveAll(tmpDir)
+	}()
+
+	cmd := exec.Command(PatchedAgyBin, "acp", "--gemini-dir", geminiDir, "--app-data-dir", "antigravity-cli", "--disable-telemetry")
+	cmd.Dir = tmpDir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = oauthSubprocessEnv(homeDir, geminiDir, proxy)
+
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdinPipe.Close()
+		return err
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		_ = stdinPipe.Close()
+		_ = stdoutPipe.Close()
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		_ = stdinPipe.Close()
+		return err
+	}
+
+	type rpcMsg struct {
+		ID     int             `json:"id"`
+		Result json.RawMessage `json:"result"`
+	}
+	msgCh := make(chan rpcMsg, 4)
+	done := make(chan struct{})
+	var ioWG sync.WaitGroup
+	ioWG.Add(2)
+	go func() {
+		defer ioWG.Done()
+		sc := bufio.NewScanner(stdoutPipe)
+		sc.Buffer(make([]byte, 64*1024), 2*1024*1024)
+		for sc.Scan() {
+			line := bytes.TrimSpace(sc.Bytes())
+			if len(line) == 0 || line[0] != '{' {
+				continue
+			}
+			var m rpcMsg
+			if json.Unmarshal(line, &m) == nil && m.ID > 0 {
+				msgCh <- m
+			}
+		}
+	}()
+	go func() {
+		defer ioWG.Done()
+		_, _ = io.Copy(io.Discard, stderrPipe)
+	}()
+	go func() {
+		ioWG.Wait()
+		_ = cmd.Wait()
+		close(done)
+	}()
+	defer stopDisposableACPProcess(cmd, stdinPipe, done)
+
+	initReq, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params": map[string]any{
+			"protocolVersion": 1,
+			"clientInfo":      map[string]any{"name": "antigravity", "version": detectAgySemver(PatchedAgyBin)},
+		},
+	})
+	if _, err := stdinPipe.Write(append(initReq, '\n')); err != nil {
+		return err
+	}
+
+	timer := time.NewTimer(8 * time.Second)
+	defer timer.Stop()
+	sentLogout := false
+	for {
+		select {
+		case m := <-msgCh:
+			if m.ID == 1 && !sentLogout {
+				var initRes struct {
+					AgentCapabilities *struct {
+						Auth *struct {
+							Logout any `json:"logout"`
+						} `json:"auth"`
+					} `json:"agentCapabilities"`
+				}
+				if json.Unmarshal(m.Result, &initRes) != nil || initRes.AgentCapabilities == nil || initRes.AgentCapabilities.Auth == nil || initRes.AgentCapabilities.Auth.Logout == nil {
+					return nil
+				}
+				sentLogout = true
+				logoutReq, _ := json.Marshal(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      2,
+					"method":  "logout",
+					"params":  map[string]any{},
+				})
+				_, _ = stdinPipe.Write(append(logoutReq, '\n'))
+				continue
+			}
+			if m.ID == 2 {
+				return nil
+			}
+		case <-done:
+			return nil
+		case <-timer.C:
+			return context.DeadlineExceeded
+		}
+	}
 }
 
 // ProbeAccountEgress tests the account's resolved proxy against ipinfo.io and daily-cloudcode-pa.googleapis.com.
@@ -782,7 +1637,8 @@ func HandleAccountsAPI(w http.ResponseWriter, r *http.Request) {
 		accs := GlobalAccountManager.ListAccounts()
 		views := make([]map[string]any, 0, len(accs))
 		for _, a := range accs {
-			hasTok := GlobalAccountManager.HasOAuthToken(a.ID)
+			meta := GlobalAccountManager.ReadAccountTokenMeta(a.ID)
+			st, _ := GlobalAccountManager.GetOAuthStatus(a.ID)
 			running, gwPort, dashPort := GlobalAccountManager.IsWorkerRunning(a.ID)
 			if a.Primary {
 				running = true
@@ -794,7 +1650,9 @@ func HandleAccountsAPI(w http.ResponseWriter, r *http.Request) {
 				"label":          a.Label,
 				"primary":        a.Primary,
 				"enabled":        a.Enabled,
-				"authenticated":  hasTok,
+				"authenticated":  meta.Authenticated,
+				"email":          meta.Email,
+				"oauthPhase":     st.Phase,
 				"running":        running,
 				"gwPort":         gwPort,
 				"dashPort":       dashPort,
@@ -821,6 +1679,21 @@ func HandleAccountsAPI(w http.ResponseWriter, r *http.Request) {
 			"proxyPresets":    LoadProxyPresets(),
 			"availableModels": availModels,
 		})
+		return
+	}
+
+	if r.Method == http.MethodGet && path == "/api/accounts/oauth/status" {
+		accountID := r.URL.Query().Get("accountId")
+		if accountID == "" {
+			accountID = r.URL.Query().Get("id")
+		}
+		snap, err := GlobalAccountManager.GetOAuthStatus(accountID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "status": snap})
 		return
 	}
 
@@ -868,33 +1741,97 @@ func HandleAccountsAPI(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "JSON 格式错误: " + err.Error()})
 			return
 		}
-		authURL, err := GlobalAccountManager.StartOAuthLogin(req.AccountID)
+		snap, err := GlobalAccountManager.StartOAuthLoginFlow(req.AccountID)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "accountId": strings.ToLower(strings.TrimSpace(req.AccountID)), "authUrl": authURL})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":        true,
+			"accountId": snap.AccountID,
+			"authUrl":   snap.AuthorizationURL,
+			"flowId":    snap.FlowID,
+			"expiresAt": snap.ExpiresAt,
+			"phase":     snap.Phase,
+			"mode":      snap.Mode,
+			"message":   snap.Message,
+			"status":    snap,
+		})
 		return
 	}
 
 	if r.Method == http.MethodPost && path == "/api/accounts/oauth/submit" {
 		var req struct {
 			AccountID string `json:"accountId"`
+			FlowID    string `json:"flowId"`
 			Code      string `json:"code"`
+			Response  string `json:"response"`
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "JSON 格式错误: " + err.Error()})
 			return
 		}
-		tier, cnt, err := GlobalAccountManager.SubmitOAuthCode(req.AccountID, req.Code)
+		rawInput := req.Code
+		if strings.TrimSpace(rawInput) == "" {
+			rawInput = req.Response
+		}
+		snap, err := GlobalAccountManager.SubmitOAuthCodeFlow(req.AccountID, req.FlowID, rawInput)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "accountId": strings.ToLower(strings.TrimSpace(req.AccountID)), "tier": tier, "modelsCount": cnt})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":          true,
+			"accountId":   snap.AccountID,
+			"tier":        snap.Tier,
+			"modelsCount": snap.ModelsCount,
+			"email":       snap.Email,
+			"status":      snap,
+		})
+		return
+	}
+
+	if r.Method == http.MethodPost && path == "/api/accounts/oauth/cancel" {
+		var req struct {
+			AccountID string `json:"accountId"`
+			FlowID    string `json:"flowId"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "JSON 格式错误: " + err.Error()})
+			return
+		}
+		snap, err := GlobalAccountManager.CancelOAuthLogin(req.AccountID, req.FlowID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "status": snap})
+		return
+	}
+
+	if r.Method == http.MethodPost && path == "/api/accounts/oauth/logout" {
+		var req struct {
+			AccountID string `json:"accountId"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "JSON 格式错误: " + err.Error()})
+			return
+		}
+		if err := GlobalAccountManager.LogoutAccount(req.AccountID); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":        true,
+			"accountId": strings.ToLower(strings.TrimSpace(req.AccountID)),
+		})
 		return
 	}
 
@@ -914,7 +1851,14 @@ func HandleAccountsAPI(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "accountId": strings.ToLower(strings.TrimSpace(req.AccountID)), "tier": tier, "modelsCount": cnt})
+		meta := GlobalAccountManager.ReadAccountTokenMeta(strings.ToLower(strings.TrimSpace(req.AccountID)))
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":          true,
+			"accountId":   strings.ToLower(strings.TrimSpace(req.AccountID)),
+			"tier":        tier,
+			"modelsCount": cnt,
+			"email":       meta.Email,
+		})
 		return
 	}
 
