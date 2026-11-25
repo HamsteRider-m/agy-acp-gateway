@@ -31,3 +31,7 @@ runtime/upgrade/
 runtime/accounts.json
 runtime/accounts/
 runtime/quota-home-*/
+bin/agy-bg-proxy
+bin/*.new
+runtime/active-slot
+runtime/slots/

@@ -17,7 +17,7 @@ import (
 var (
 	tosPhraseRe = regexp.MustCompile(`(?i)violation of Terms of Service|This service has been disabled in this account|account has been (?:suspended|disabled|terminated) for violating`)
 	tos403Re    = regexp.MustCompile(`(?i)(?:403|PERMISSION_DENIED).*?(?:Terms of Service|disabled in this account|suspended)|(?:Terms of Service|disabled in this account).*?(?:403|PERMISSION_DENIED)`)
-	tosSoftRe   = regexp.MustCompile(`(?i)^\s*(?:(?:error[: ]+|403[: ]+|PERMISSION_DENIED[: ]+)\s*)?This service has been disabled in this account(?: for violation of Terms of Service)?[.!]?\s*$`)
+	tosSoftRe   = regexp.MustCompile(`(?i)^\s*(?:⚠\s*)?(?:(?:error[: ]+|403[: ]+|PERMISSION_DENIED[: ]+)\s*)?This service has been disabled in this account(?: for violation of Terms of Service)?[.!]?(?:\s+Please submit an appeal[^\r\n]*)?\s*$`)
 )
 
 // IsTosViolationError detects upstream ToS suspension/account-disabled errors from RPC error strings.

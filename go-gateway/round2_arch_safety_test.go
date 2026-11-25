@@ -150,8 +150,12 @@ func TestRound2_AccountSandboxSeededAndAmbientEnvStripped(t *testing.T) {
 	}
 	dotGemini := filepath.Join(am.AccountHomeDir(prim.ID), ".gemini")
 	resolved, err := filepath.EvalSymlinks(dotGemini)
-	if err != nil || filepath.Clean(resolved) != filepath.Clean(pureHome) {
-		t.Fatalf("expected %s symlink -> %s, got %q (err=%v)", dotGemini, pureHome, resolved, err)
+	expectedPure := filepath.Clean(pureHome)
+	if evalPure, evalErr := filepath.EvalSymlinks(pureHome); evalErr == nil {
+		expectedPure = filepath.Clean(evalPure)
+	}
+	if err != nil || filepath.Clean(resolved) != expectedPure {
+		t.Fatalf("expected %s symlink -> %s, got %q (err=%v)", dotGemini, expectedPure, resolved, err)
 	}
 
 	for _, kv := range []string{

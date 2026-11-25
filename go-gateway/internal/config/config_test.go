@@ -78,3 +78,23 @@ func TestSecretRedactionAndOpenPrivateLog(t *testing.T) {
 		t.Fatalf("expected 0600 permissions, got %#o", info.Mode().Perm())
 	}
 }
+
+func TestDrainTimeoutSecParsing(t *testing.T) {
+	t.Cleanup(func() { Reload() })
+	t.Setenv("AGY_DRAIN_TIMEOUT_SEC", "")
+	if got := Reload().DrainTimeoutSec; got != 0 {
+		t.Fatalf("expected unset DrainTimeoutSec=0, got %d", got)
+	}
+	t.Setenv("AGY_DRAIN_TIMEOUT_SEC", "0")
+	if got := Reload().DrainTimeoutSec; got != 1 {
+		t.Fatalf("expected clamped min DrainTimeoutSec=1, got %d", got)
+	}
+	t.Setenv("AGY_DRAIN_TIMEOUT_SEC", "120")
+	if got := Reload().DrainTimeoutSec; got != 120 {
+		t.Fatalf("expected DrainTimeoutSec=120, got %d", got)
+	}
+	t.Setenv("AGY_DRAIN_TIMEOUT_SEC", "999")
+	if got := Reload().DrainTimeoutSec; got != 600 {
+		t.Fatalf("expected clamped max DrainTimeoutSec=600, got %d", got)
+	}
+}

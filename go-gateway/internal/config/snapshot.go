@@ -90,6 +90,7 @@ type Snapshot struct {
 	ResinProxyToken              string
 	ResinHost                    string
 	AccountPlanTierHint          string
+	DrainTimeoutSec              int
 }
 
 // DashboardPeerConfig describes a peer gateway instance aggregated into the primary dashboard.
@@ -279,6 +280,17 @@ func ResolveProjectHome() string {
 func LoadFromEnv() *Snapshot {
 	home := ResolveProjectHome()
 	parkedSec := EnvInt("AGY_PARKED_TTL_SEC", 0)
+	drainTimeoutSec := 0
+	if raw := strings.TrimSpace(os.Getenv("AGY_DRAIN_TIMEOUT_SEC")); raw != "" {
+		if sec, err := strconv.Atoi(raw); err == nil {
+			if sec < 1 {
+				sec = 1
+			} else if sec > 600 {
+				sec = 600
+			}
+			drainTimeoutSec = sec
+		}
+	}
 	parkedDur := 300 * time.Second
 	if parkedSec > 0 {
 		parkedDur = time.Duration(parkedSec) * time.Second
@@ -403,6 +415,7 @@ func LoadFromEnv() *Snapshot {
 		ResinProxyToken:              strings.TrimSpace(os.Getenv("AGY_RESIN_PROXY_TOKEN")),
 		ResinHost:                    EnvStr("AGY_RESIN_HOST", "resin:2260"),
 		AccountPlanTierHint:          strings.TrimSpace(os.Getenv("AGY_ACCOUNT_PLAN_TIER_HINT")),
+		DrainTimeoutSec:              drainTimeoutSec,
 	}
 }
 

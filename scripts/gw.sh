@@ -40,6 +40,8 @@ elif [[ "${AGY_GW_PORT:-18890}" == 18890 && "${AGY_RUN_DIR:-$ROOT/runtime}" == "
 fi
 GW_PORT="${AGY_GW_PORT:-18890}"
 DASH_PORT="${AGY_DASH_PORT:-$((GW_PORT + 1))}"
+READY_HOST="${AGY_LISTEN_HOST:-127.0.0.1}"
+if [[ "$READY_HOST" == "0.0.0.0" || "$READY_HOST" == "::" ]]; then READY_HOST="127.0.0.1"; fi
 if [[ ! "$GW_PORT" =~ ^[0-9]+$ || ! "$DASH_PORT" =~ ^[0-9]+$ ]] || (( GW_PORT<1 || GW_PORT>65535 || DASH_PORT<1 || DASH_PORT>65535 || GW_PORT==DASH_PORT )); then
   echo 'Invalid gateway/dashboard ports' >&2; exit 1
 fi
@@ -128,8 +130,14 @@ stop_one() {
       [[ -n "$ticks" ]] && descendants+=("$child:$ticks")
     fi
   done < <(ps -eo pid=,ppid= | awk -v root="$pid" '{parent[$1]=$2} END {for(p in parent){q=p;for(n=0;n<128 && q in parent;n++){if(parent[q]==root){print p;break}q=parent[q]}}}')
+  local wait_ticks=120 drain_sec=0
+  if [[ "${AGY_DRAIN_TIMEOUT_SEC:-}" =~ ^[0-9]+$ ]] && (( AGY_DRAIN_TIMEOUT_SEC > 10 )); then
+    drain_sec="$AGY_DRAIN_TIMEOUT_SEC"
+    if (( drain_sec > 600 )); then drain_sec=600; fi
+    wait_ticks=$(( (drain_sec + 10) * 10 ))
+  fi
   kill -TERM "$pid" 2>/dev/null || true
-  for ((i=0;i<120;i++)); do
+  for ((i=0;i<wait_ticks;i++)); do
     kill -0 "$pid" 2>/dev/null || break
     [[ "$(ps -o stat= -p "$pid" 2>/dev/null || true)" == Z* ]] && break
     sleep 0.1
@@ -170,7 +178,7 @@ start() {
   remember_pid gateway "$gw_pid"
   printf '%s\n' "$mode" >"$RUN/mode"
   for ((i=0;i<40;i++)); do
-    if curl --noproxy '*' -fsS -m 1 "http://127.0.0.1:$GW_PORT/healthz" >/dev/null 2>&1 && port_busy "$DASH_PORT"; then status; return 0; fi
+    if curl --noproxy '*' -fsS -m 1 "http://$READY_HOST:$GW_PORT/healthz" >/dev/null 2>&1 && port_busy "$DASH_PORT"; then status; return 0; fi
     if ! kill -0 "$gw_pid" 2>/dev/null; then
       echo 'Gateway process exited before readiness' >&2; stop; return 1
     fi
@@ -185,7 +193,7 @@ status() {
   done
   local pid
   if pid="$(owned_pid gateway)"; then ps -o pid=,rss=,comm= -p "$pid"; fi
-  curl --noproxy '*' -fsS -m 3 "http://127.0.0.1:$GW_PORT/healthz" || return 1
+  curl --noproxy '*' -fsS -m 3 "http://$READY_HOST:$GW_PORT/healthz" || return 1
   echo
 }
 # Serialize mutations so two concurrent starts cannot overwrite ownership metadata.
