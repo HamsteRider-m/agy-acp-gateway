@@ -172,7 +172,9 @@ func normalizeMonitorCaps(soft, drain, hard int) (int, int, int) {
 
 func defaultMonitorCapsForTier(planTier string) (soft, drain, hard int) {
 	cfg := gwcfg.Current()
-	if normalizePlanTierHint(planTier) == "pro" {
+	tier := normalizePlanTierHint(planTier)
+	if tier == "pro" || tier == "ultra_5x" {
+		// The 5x monitor cap is uncalibrated; use conservative Pro thresholds by default.
 		return normalizeMonitorCaps(cfg.MonitorSoftCapPro, cfg.MonitorDrainCapPro, cfg.MonitorHardCapPro)
 	}
 	return normalizeMonitorCaps(cfg.MonitorSoftCapUltra, cfg.MonitorDrainCapUltra, cfg.MonitorHardCapUltra)
@@ -703,7 +705,7 @@ func (a *monitorBudgetAccount) effectiveCapsLocked(planTier string) (soft, drain
 
 // EvaluateMonitorBudget computes the current 3-zone budget snapshot for one account.
 func EvaluateMonitorBudget(acc AccountProfile, now time.Time) MonitorBudgetSnapshot {
-	return evaluateMonitorBudgetByIDTier(acc.ID, acc.PlanTierHint, now)
+	return evaluateMonitorBudgetByIDTier(acc.ID, acc.EffectivePlanTier(), now)
 }
 
 func evaluateMonitorBudgetByIDTier(accountID, planTier string, now time.Time) MonitorBudgetSnapshot {
@@ -766,7 +768,7 @@ func currentProcessMonitorBudget(now time.Time) MonitorBudgetSnapshot {
 	tier := ""
 	if GlobalAccountManager != nil && GlobalAccountManager.HasConfiguredAccounts() {
 		if acc, ok := GlobalAccountManager.GetAccount(id); ok {
-			tier = acc.PlanTierHint
+			tier = acc.EffectivePlanTier()
 		}
 	}
 	if tier == "" {
@@ -784,7 +786,7 @@ func MonitorUtilizationRatio(accountID string, now time.Time) float64 {
 	tier := ""
 	if GlobalAccountManager != nil && GlobalAccountManager.HasConfiguredAccounts() {
 		if acc, ok := GlobalAccountManager.GetAccount(id); ok {
-			tier = acc.PlanTierHint
+			tier = acc.EffectivePlanTier()
 		}
 	}
 	if tier == "" {
@@ -858,7 +860,7 @@ func autoCalibrateMonitorCapOnTrip(accountID string, now time.Time) bool {
 	tier := ""
 	if GlobalAccountManager != nil && GlobalAccountManager.HasConfiguredAccounts() {
 		if acc, ok := GlobalAccountManager.GetAccount(id); ok {
-			tier = acc.PlanTierHint
+			tier = acc.EffectivePlanTier()
 		}
 	}
 	monitorBudgets.mu.Lock()

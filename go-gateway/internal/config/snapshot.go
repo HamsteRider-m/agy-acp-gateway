@@ -102,19 +102,20 @@ type Snapshot struct {
 	ChildAccountWorker           bool
 	AccountsFile                 string
 	// MonitorTripRouting / MonitorTripHop / MonitorBudget*: monitor budget governor v2 (see monitor_trip.go, monitor_budget.go).
-	MonitorTripRouting   bool
-	MonitorTripHop       bool
-	MonitorBudgetSpread  bool
-	MonitorSoftCapUltra  int
-	MonitorDrainCapUltra int
-	MonitorHardCapUltra  int
-	MonitorSoftCapPro    int
-	MonitorDrainCapPro   int
-	MonitorHardCapPro    int
-	ProxyPresetsFile     string
-	ResinProxyToken      string
-	ResinHost            string
-	AccountPlanTierHint  string
+	MonitorTripRouting      bool
+	MonitorTripHop          bool
+	MonitorBudgetSpread     bool
+	MonitorSoftCapUltra     int
+	MonitorDrainCapUltra    int
+	MonitorHardCapUltra     int
+	MonitorSoftCapPro       int
+	MonitorDrainCapPro      int
+	MonitorHardCapPro       int
+	ProxyPresetsFile        string
+	ResinProxyToken         string
+	ResinHost               string
+	AccountPlanTierHint     string
+	AccountPlanTierOverride string
 }
 
 // DashboardPeerConfig describes a peer gateway instance aggregated into the primary dashboard.
@@ -491,6 +492,7 @@ func LoadFromEnv() *Snapshot {
 		ResinProxyToken:              strings.TrimSpace(os.Getenv("AGY_RESIN_PROXY_TOKEN")),
 		ResinHost:                    EnvStr("AGY_RESIN_HOST", "resin:2260"),
 		AccountPlanTierHint:          strings.TrimSpace(os.Getenv("AGY_ACCOUNT_PLAN_TIER_HINT")),
+		AccountPlanTierOverride:      strings.TrimSpace(os.Getenv("AGY_ACCOUNT_PLAN_TIER_OVERRIDE")),
 	}
 }
 

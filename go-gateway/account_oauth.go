@@ -167,6 +167,10 @@ func (am *AccountManager) ManagedPeersForDashboard() (peers []gwcfg.DashboardPee
 
 // UpsertAccount creates or updates an AccountProfile and persists accounts.json.
 func (am *AccountManager) UpsertAccount(in AccountProfile) (AccountProfile, error) {
+	return am.upsertAccount(in, false)
+}
+
+func (am *AccountManager) upsertAccount(in AccountProfile, hasPlanTierOverride bool) (AccountProfile, error) {
 	am.ensureInitialized()
 	in.ID = strings.ToLower(strings.TrimSpace(in.ID))
 	if !validAccountIDRe.MatchString(in.ID) {
@@ -277,6 +281,7 @@ func (am *AccountManager) UpsertAccount(in AccountProfile) (AccountProfile, erro
 	}
 	in.Role = normalizeAccountRole(in.Role)
 	in.PlanTierHint = normalizePlanTierHint(in.PlanTierHint)
+	in.PlanTierOverride = normalizePlanTierHint(in.PlanTierOverride)
 	if in.MaxLiveWorkers <= 0 {
 		if foundIdx >= 0 && prevAcc.MaxLiveWorkers > 0 {
 			in.MaxLiveWorkers = prevAcc.MaxLiveWorkers
@@ -298,6 +303,9 @@ func (am *AccountManager) UpsertAccount(in AccountProfile) (AccountProfile, erro
 	if foundIdx >= 0 {
 		if in.PlanTierHint == "" {
 			in.PlanTierHint = normalizePlanTierHint(prevAcc.PlanTierHint)
+		}
+		if !hasPlanTierOverride && in.PlanTierOverride == "" {
+			in.PlanTierOverride = normalizePlanTierHint(prevAcc.PlanTierOverride)
 		}
 		in.SchedState, in.Enabled = normalizeSchedState(in.SchedState, in.Enabled)
 		am.accounts[foundIdx] = in
@@ -343,12 +351,17 @@ func (am *AccountManager) UpsertAccount(in AccountProfile) (AccountProfile, erro
 		}
 	}
 
+	planTierOverrideChanged := foundIdx >= 0 && prevAcc.PlanTierOverride != in.PlanTierOverride
+	if in.Primary && planTierOverrideChanged {
+		InvalidatePrimaryQuotaTierCache(in.PlanTierOverride)
+	}
 	workerCfgChanged := foundIdx < 0 ||
 		prevAcc.ProxyPreset != in.ProxyPreset ||
 		prevAcc.CustomProxy != in.CustomProxy ||
 		prevAcc.MaxLiveWorkers != in.MaxLiveWorkers ||
 		prevAcc.Enabled != in.Enabled ||
-		prevAcc.PlanTierHint != in.PlanTierHint
+		prevAcc.PlanTierHint != in.PlanTierHint ||
+		planTierOverrideChanged
 	if !in.Primary && workerCfgChanged {
 		am.StopAccountWorker(in.ID)
 		if cur, ok := am.GetAccount(in.ID); ok && cur.Enabled && am.HasOAuthToken(in.ID) {
@@ -942,11 +955,17 @@ func (am *AccountManager) probeAccountModelsTier(acc AccountProfile) (tierLabel 
 			modelsCount++
 		}
 	}
+	if ov := normalizePlanTierHint(acc.PlanTierOverride); ov != "" {
+		return fmt.Sprintf("%s (%d 款模型)", planLabelForTier(ov), modelsCount), modelsCount
+	}
 	if strings.Contains(s, "gemini-pro-orchestrator-g1-pro") {
 		am.SetAccountPlanTierHint(acc.ID, "pro")
 		return fmt.Sprintf("Google One AI Pro (%d 款模型)", modelsCount), modelsCount
 	}
 	if strings.Contains(s, "gemini-4-carbon") {
+		if normalizePlanTierHint(acc.PlanTierHint) == "ultra_5x" {
+			return fmt.Sprintf("Ultra 5x (%d 款模型)", modelsCount), modelsCount
+		}
 		am.SetAccountPlanTierHint(acc.ID, "ultra")
 		return fmt.Sprintf("20x / Ultra 池 (%d 款模型)", modelsCount), modelsCount
 	}
@@ -1133,6 +1152,8 @@ func HandleAccountsAPI(w http.ResponseWriter, r *http.Request) {
 				"groups":                  a.Groups,
 				"notes":                   a.Notes,
 				"planTierHint":            a.PlanTierHint,
+				"planTierOverride":        a.PlanTierOverride,
+				"effectivePlanTier":       a.EffectivePlanTier(),
 				"authenticated":           hasTok,
 				"running":                 running,
 				"gwPort":                  gwPort,
@@ -1188,13 +1209,22 @@ func HandleAccountsAPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodPost && path == "/api/accounts" {
+		bodyBytes, readErr := io.ReadAll(io.LimitReader(r.Body, 256*1024))
+		if readErr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "读取请求体失败: " + readErr.Error()})
+			return
+		}
 		var in AccountProfile
-		if err := json.NewDecoder(io.LimitReader(r.Body, 256*1024)).Decode(&in); err != nil {
+		if err := json.Unmarshal(bodyBytes, &in); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "JSON 格式错误: " + err.Error()})
 			return
 		}
-		saved, err := GlobalAccountManager.UpsertAccount(in)
+		var rawKeys map[string]json.RawMessage
+		_ = json.Unmarshal(bodyBytes, &rawKeys)
+		_, hasPlanTierOverride := rawKeys["planTierOverride"]
+		saved, err := GlobalAccountManager.upsertAccount(in, hasPlanTierOverride)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})

@@ -222,24 +222,34 @@ func normalizeAccountRole(raw string) string {
 
 // AccountProfile persists configuration for one isolated account environment.
 type AccountProfile struct {
-	ID             string   `json:"id"`
-	Label          string   `json:"label"`
-	Primary        bool     `json:"primary"`
-	Enabled        bool     `json:"enabled"`
-	Role           string   `json:"role,omitempty"`
-	ProxyPreset    string   `json:"proxyPreset"`
-	CustomProxy    string   `json:"customProxy,omitempty"`
-	MaxLiveWorkers int      `json:"maxLiveWorkers"`
-	BoundKeys      []string `json:"boundKeys"`
-	AllowedModels  []string `json:"allowedModels"`
-	DefaultModels  []string `json:"defaultModels,omitempty"`
-	SchedState     string   `json:"schedState,omitempty"`
-	Priority       int      `json:"priority,omitempty"`
-	Weight         int      `json:"weight,omitempty"`
-	MaxConcurrency int      `json:"maxConcurrency,omitempty"`
-	Groups         []string `json:"groups,omitempty"`
-	Notes          string   `json:"notes,omitempty"`
-	PlanTierHint   string   `json:"planTierHint,omitempty"`
+	ID               string   `json:"id"`
+	Label            string   `json:"label"`
+	Primary          bool     `json:"primary"`
+	Enabled          bool     `json:"enabled"`
+	Role             string   `json:"role,omitempty"`
+	ProxyPreset      string   `json:"proxyPreset"`
+	CustomProxy      string   `json:"customProxy,omitempty"`
+	MaxLiveWorkers   int      `json:"maxLiveWorkers"`
+	BoundKeys        []string `json:"boundKeys"`
+	AllowedModels    []string `json:"allowedModels"`
+	DefaultModels    []string `json:"defaultModels,omitempty"`
+	SchedState       string   `json:"schedState,omitempty"`
+	Priority         int      `json:"priority,omitempty"`
+	Weight           int      `json:"weight,omitempty"`
+	MaxConcurrency   int      `json:"maxConcurrency,omitempty"`
+	Groups           []string `json:"groups,omitempty"`
+	Notes            string   `json:"notes,omitempty"`
+	PlanTierHint     string   `json:"planTierHint,omitempty"`
+	PlanTierOverride string   `json:"planTierOverride,omitempty"`
+}
+
+// EffectivePlanTier returns the operator-configured PlanTierOverride if present,
+// falling back to the auto-detected PlanTierHint.
+func (a AccountProfile) EffectivePlanTier() string {
+	if ov := normalizePlanTierHint(a.PlanTierOverride); ov != "" {
+		return ov
+	}
+	return normalizePlanTierHint(a.PlanTierHint)
 }
 
 func (a AccountProfile) EffectiveRole() string {
@@ -1772,6 +1782,7 @@ func normalizeAccountsList(in []AccountProfile, schemaVer int) []AccountProfile 
 		a.SchedState, a.Enabled = normalizeSchedState(a.SchedState, a.Enabled)
 		a.Role = normalizeAccountRole(a.Role)
 		a.PlanTierHint = normalizePlanTierHint(a.PlanTierHint)
+		a.PlanTierOverride = normalizePlanTierHint(a.PlanTierOverride)
 		if a.Priority <= 0 {
 			a.Priority = defaultAccountPriority
 		} else if a.Priority > 1000 {
@@ -2137,6 +2148,10 @@ func (am *AccountManager) SetAccountPlanTierHint(accountID, tier string) {
 	changed := false
 	for i := range am.accounts {
 		if am.accounts[i].ID == id {
+			// Never overwrite an explicit manual tier override during automatic probes.
+			if normalizePlanTierHint(am.accounts[i].PlanTierOverride) != "" {
+				break
+			}
 			if am.accounts[i].PlanTierHint != norm {
 				am.accounts[i].PlanTierHint = norm
 				changed = true
@@ -2148,6 +2163,96 @@ func (am *AccountManager) SetAccountPlanTierHint(accountID, tier string) {
 		_ = am.saveToDiskLocked()
 	}
 	am.mu.Unlock()
+}
+
+func buildAccountWorkerEnv(acc AccountProfile, homeDir, resolvedProxy, childMemLimit string, gwPort, dashPort, childMaxWorkers, childMaxPrompts, gCap int, maxConcurrentPromptsEnvSet bool) []string {
+	env := make([]string, 0, len(os.Environ())+30)
+	hasSSH := false
+	for _, kv := range os.Environ() {
+		if isStrippedAgyEngineEnv(kv) {
+			continue
+		}
+		if strings.HasPrefix(kv, "SSH_CONNECTION=") {
+			hasSSH = true
+		}
+		switch {
+		case strings.HasPrefix(kv, "HOME="),
+			strings.HasPrefix(kv, "AGY_CHILD_ACCOUNT_WORKER="),
+			strings.HasPrefix(kv, "AGY_PURE_API_HOME="),
+			strings.HasPrefix(kv, "AGY_DEFAULT_CWD="),
+			strings.HasPrefix(kv, "AGY_STATE_DB="),
+			strings.HasPrefix(kv, "AGY_TOS_TRIPPED_FILE="),
+			strings.HasPrefix(kv, "AGY_GW_LOG="),
+			strings.HasPrefix(kv, "AGY_GW_TMPLOG="),
+			strings.HasPrefix(kv, "AGY_APPDATA_LINK="),
+			strings.HasPrefix(kv, "AGY_CONV_DIR="),
+			strings.HasPrefix(kv, "AGY_APP_CONV_DIR="),
+			strings.HasPrefix(kv, "AGY_WAF_RULES_FILE="),
+			strings.HasPrefix(kv, "AGY_ACP_RECORD="),
+			strings.HasPrefix(kv, "AGY_LISTEN_HOST="),
+			strings.HasPrefix(kv, "AGY_GW_PORT="),
+			strings.HasPrefix(kv, "AGY_DASH_PORT="),
+			strings.HasPrefix(kv, "AGY_INSTANCE_ID="),
+			strings.HasPrefix(kv, "AGY_INSTANCE_LABEL="),
+			strings.HasPrefix(kv, "AGY_MAX_LIVE_WORKERS="),
+			strings.HasPrefix(kv, "AGY_GLOBAL_MAX_LIVE_WORKERS="),
+			(!maxConcurrentPromptsEnvSet && strings.HasPrefix(kv, "AGY_MAX_CONCURRENT_PROMPTS=")),
+			strings.HasPrefix(kv, "AGY_UPSTREAM_PROXY="),
+			strings.HasPrefix(kv, "AGY_DASHBOARD_PEERS="),
+			strings.HasPrefix(kv, "AGY_ACCOUNTS_FILE="),
+			strings.HasPrefix(kv, "AGY_PROXY_PRESETS_FILE="),
+			strings.HasPrefix(kv, "AGY_RESIN_PROXY_TOKEN="),
+			strings.HasPrefix(kv, "AGY_RESIN_HOST="),
+			strings.HasPrefix(kv, "AGY_ACCOUNT_PLAN_TIER_HINT="),
+			strings.HasPrefix(kv, "AGY_ACCOUNT_PLAN_TIER_OVERRIDE="):
+			continue
+		}
+		env = append(env, kv)
+	}
+	if runtime.GOOS == "darwin" && !hasSSH {
+		env = append(env, "SSH_CONNECTION=1 1 1 1")
+	}
+	env = append(env,
+		"AGY_CHILD_ACCOUNT_WORKER=1",
+		"GOMEMLIMIT="+childMemLimit,
+		"DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null",
+		"AGY_CLI_DISABLE_AUTO_UPDATE=1",
+		"HOME="+homeDir,
+		"AGY_PURE_API_HOME="+filepath.Join(homeDir, ".gemini"),
+		"AGY_DEFAULT_CWD="+filepath.Join(homeDir, "workspace"),
+		"AGY_STATE_DB="+filepath.Join(homeDir, "gateway.db"),
+		"AGY_TOS_TRIPPED_FILE="+filepath.Join(homeDir, "tos-tripped"),
+		"AGY_GW_LOG="+filepath.Join(homeDir, "logs", "gateway.log"),
+		"AGY_APP_CONV_DIR=off",
+		"AGY_LISTEN_HOST=127.0.0.1",
+		fmt.Sprintf("AGY_GW_PORT=%d", gwPort),
+		fmt.Sprintf("AGY_DASH_PORT=%d", dashPort),
+		"AGY_INSTANCE_ID="+acc.ID,
+		"AGY_INSTANCE_LABEL="+acc.Label,
+		fmt.Sprintf("AGY_MAX_LIVE_WORKERS=%d", childMaxWorkers),
+		"AGY_UPSTREAM_PROXY="+resolvedProxy,
+		"HTTP_PROXY="+resolvedProxy,
+		"HTTPS_PROXY="+resolvedProxy,
+		"http_proxy="+resolvedProxy,
+		"https_proxy="+resolvedProxy,
+		"ALL_PROXY=",
+		"all_proxy=",
+		"NO_PROXY=127.0.0.1,localhost,::1",
+		"no_proxy=127.0.0.1,localhost,::1",
+		"AGY_DASHBOARD_PEERS=",
+	)
+	if gCap > 0 {
+		env = append(env, fmt.Sprintf("AGY_GLOBAL_MAX_LIVE_WORKERS=%d", gCap))
+	}
+	if ov := normalizePlanTierHint(acc.PlanTierOverride); ov != "" {
+		env = append(env, "AGY_ACCOUNT_PLAN_TIER_OVERRIDE="+ov, "AGY_ACCOUNT_PLAN_TIER_HINT="+ov)
+	} else if hint := normalizePlanTierHint(acc.PlanTierHint); hint != "" {
+		env = append(env, "AGY_ACCOUNT_PLAN_TIER_HINT="+hint)
+	}
+	if !maxConcurrentPromptsEnvSet {
+		env = append(env, fmt.Sprintf("AGY_MAX_CONCURRENT_PROMPTS=%d", childMaxPrompts))
+	}
+	return env
 }
 
 func isLoopbackPortFree(port int) bool {
@@ -2346,90 +2451,7 @@ func (am *AccountManager) EnsureAccountWorkerRunningWithContext(ctx context.Cont
 	stderrTail := &boundedTailBuffer{max: 4096}
 	cmd.Stderr = stderrTail
 
-	env := make([]string, 0, len(os.Environ())+30)
-	hasSSH := false
-	for _, kv := range os.Environ() {
-		if isStrippedAgyEngineEnv(kv) {
-			continue
-		}
-		if strings.HasPrefix(kv, "SSH_CONNECTION=") {
-			hasSSH = true
-		}
-		switch {
-		case strings.HasPrefix(kv, "HOME="),
-			strings.HasPrefix(kv, "AGY_CHILD_ACCOUNT_WORKER="),
-			strings.HasPrefix(kv, "AGY_PURE_API_HOME="),
-			strings.HasPrefix(kv, "AGY_DEFAULT_CWD="),
-			strings.HasPrefix(kv, "AGY_STATE_DB="),
-			strings.HasPrefix(kv, "AGY_TOS_TRIPPED_FILE="),
-			strings.HasPrefix(kv, "AGY_GW_LOG="),
-			strings.HasPrefix(kv, "AGY_GW_TMPLOG="),
-			strings.HasPrefix(kv, "AGY_APPDATA_LINK="),
-			strings.HasPrefix(kv, "AGY_CONV_DIR="),
-			strings.HasPrefix(kv, "AGY_APP_CONV_DIR="),
-			strings.HasPrefix(kv, "AGY_WAF_RULES_FILE="),
-			strings.HasPrefix(kv, "AGY_ACP_RECORD="),
-			strings.HasPrefix(kv, "AGY_LISTEN_HOST="),
-			strings.HasPrefix(kv, "AGY_GW_PORT="),
-			strings.HasPrefix(kv, "AGY_DASH_PORT="),
-			strings.HasPrefix(kv, "AGY_INSTANCE_ID="),
-			strings.HasPrefix(kv, "AGY_INSTANCE_LABEL="),
-			strings.HasPrefix(kv, "AGY_MAX_LIVE_WORKERS="),
-			strings.HasPrefix(kv, "AGY_GLOBAL_MAX_LIVE_WORKERS="),
-			(!cfgSnap.MaxConcurrentPromptsEnvSet && strings.HasPrefix(kv, "AGY_MAX_CONCURRENT_PROMPTS=")),
-			strings.HasPrefix(kv, "AGY_UPSTREAM_PROXY="),
-			strings.HasPrefix(kv, "AGY_DASHBOARD_PEERS="),
-			strings.HasPrefix(kv, "AGY_ACCOUNTS_FILE="),
-			strings.HasPrefix(kv, "AGY_PROXY_PRESETS_FILE="),
-			strings.HasPrefix(kv, "AGY_RESIN_PROXY_TOKEN="),
-			strings.HasPrefix(kv, "AGY_RESIN_HOST="),
-			strings.HasPrefix(kv, "AGY_ACCOUNT_PLAN_TIER_HINT="):
-			continue
-		}
-		env = append(env, kv)
-	}
-	if runtime.GOOS == "darwin" && !hasSSH {
-		env = append(env, "SSH_CONNECTION=1 1 1 1")
-	}
-	env = append(env,
-		"AGY_CHILD_ACCOUNT_WORKER=1",
-		"GOMEMLIMIT="+childMemLimit,
-		"DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null",
-		"AGY_CLI_DISABLE_AUTO_UPDATE=1",
-		"HOME="+homeDir,
-		"AGY_PURE_API_HOME="+filepath.Join(homeDir, ".gemini"),
-		"AGY_DEFAULT_CWD="+filepath.Join(homeDir, "workspace"),
-		"AGY_STATE_DB="+filepath.Join(homeDir, "gateway.db"),
-		"AGY_TOS_TRIPPED_FILE="+filepath.Join(homeDir, "tos-tripped"),
-		"AGY_GW_LOG="+filepath.Join(homeDir, "logs", "gateway.log"),
-		"AGY_APP_CONV_DIR=off",
-		"AGY_LISTEN_HOST=127.0.0.1",
-		fmt.Sprintf("AGY_GW_PORT=%d", gwPort),
-		fmt.Sprintf("AGY_DASH_PORT=%d", dashPort),
-		"AGY_INSTANCE_ID="+acc.ID,
-		"AGY_INSTANCE_LABEL="+acc.Label,
-		fmt.Sprintf("AGY_MAX_LIVE_WORKERS=%d", childMaxWorkers),
-		"AGY_UPSTREAM_PROXY="+resolvedProxy,
-		"HTTP_PROXY="+resolvedProxy,
-		"HTTPS_PROXY="+resolvedProxy,
-		"http_proxy="+resolvedProxy,
-		"https_proxy="+resolvedProxy,
-		"ALL_PROXY=",
-		"all_proxy=",
-		"NO_PROXY=127.0.0.1,localhost,::1",
-		"no_proxy=127.0.0.1,localhost,::1",
-		"AGY_DASHBOARD_PEERS=",
-	)
-	if gCap > 0 {
-		env = append(env, fmt.Sprintf("AGY_GLOBAL_MAX_LIVE_WORKERS=%d", gCap))
-	}
-	if hint := normalizePlanTierHint(acc.PlanTierHint); hint != "" {
-		env = append(env, "AGY_ACCOUNT_PLAN_TIER_HINT="+hint)
-	}
-	if !cfgSnap.MaxConcurrentPromptsEnvSet {
-		env = append(env, fmt.Sprintf("AGY_MAX_CONCURRENT_PROMPTS=%d", childMaxPrompts))
-	}
-	cmd.Env = env
+	cmd.Env = buildAccountWorkerEnv(acc, homeDir, resolvedProxy, childMemLimit, gwPort, dashPort, childMaxWorkers, childMaxPrompts, gCap, cfgSnap.MaxConcurrentPromptsEnvSet)
 
 	if err := cmd.Start(); err != nil {
 		return abortPlaceholder(err, true)

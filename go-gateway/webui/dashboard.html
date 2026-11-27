@@ -1199,7 +1199,8 @@ const unit = (n) => {
 };
 const usd = (n, d = 2) => '$' + Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
 const capUsd = (n) => {
-  const v = Number(n || 0);
+  if (n == null || !Number.isFinite(Number(n)) || Number(n) <= 0) return '--';
+  const v = Number(n);
   return Number.isInteger(v) ? usd(v, 0) : usd(v, 2);
 };
 const dur = (ms) => !ms || ms <= 0 ? '--' : ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms';
@@ -1868,12 +1869,12 @@ function poolMetricCells({ used5h, cap5h, local5h, steps5h, idle5h, mon5hUsd, mo
   return `
     <div class="pf-cell"${tip5h}>
       <div class="k">5 小时已用</div>
-      <div class="v">${used5h == null ? dash : usd(used5h) + '<span class="cap">/ ' + capUsd(cap5h) + '</span>'}</div>
+      <div class="v">${used5h == null ? dash : usd(used5h) + (cap5h > 0 ? '<span class="cap">/ ' + capUsd(cap5h) + '</span>' : '')}</div>
       <div class="sub">${sub5h}</div>${monSub5h}
     </div>
     <div class="pf-cell"${tipWk}>
       <div class="k">7 天已用</div>
-      <div class="v">${usedWk == null ? dash : usd(usedWk) + '<span class="cap">/ ' + capUsd(capWk) + '</span>'}</div>
+      <div class="v">${usedWk == null ? dash : usd(usedWk) + (capWk > 0 ? '<span class="cap">/ ' + capUsd(capWk) + '</span>' : '')}</div>
       <div class="sub">${subWk}</div>${monSubWk}
     </div>
     <div class="pf-cell"${remTip}>
@@ -2371,10 +2372,11 @@ function renderPools(d, rootData = d, fromPoll = false) {
   const gWkExhausted = !!(bw && bw.remainingFraction <= 0.0005);
 
   const isProPlan = q.planTier === 'pro';
-  const gemCap5hFallback = isProPlan ? 10 : 200;
-  const gemCapWkFallback = isProPlan ? 35 : 800;
-  const tpCap5hFallback = isProPlan ? 2.5 : 25;
-  const tpCapWkFallback = isProPlan ? 5 : 50;
+  const unknownCaps = q.planTier === 'ultra_5x';
+  const gemCap5hFallback = unknownCaps ? null : (isProPlan ? 10 : 200);
+  const gemCapWkFallback = unknownCaps ? null : (isProPlan ? 35 : 800);
+  const tpCap5hFallback = unknownCaps ? null : (isProPlan ? 2.5 : 25);
+  const tpCapWkFallback = unknownCaps ? null : (isProPlan ? 5 : 50);
 
   const gemAgyVer = (d.gateway && d.gateway.agyVersion) || '';
   setHTML('b-gem', poolBadgeHTML(gp.state, gp.updatedAt, q.argonPool, q.planLabel) + buildBurnAnomalyPillsHTML(ded, gemAgyVer));
@@ -4172,6 +4174,9 @@ function renderAccountsList() {
         : '<span class="pool-badge warn">待授权</span>';
     const extraBadges = buildHealthBadgesHTML(sched, !!a.isActiveTarget, h, { skipUnauth: !a.authenticated, accountId: a.id, poolStats: accState.poolStats });
     const standbyBadge = standbyBadgeHTML(isStandbyRole(a));
+    const tierCode = a.planTierOverride || a.effectivePlanTier || a.planTierHint || '';
+    const tierLbl = tierCode === 'ultra_5x' ? 'Ultra 5x' : tierCode === 'pro' ? 'AI Pro' : tierCode === 'ultra' ? 'Ultra 20x' : '';
+    const tierBadge = tierLbl ? '<span class="pool-badge">' + esc(tierLbl + (a.planTierOverride ? ' (手动)' : '')) + '</span>' : '';
     const keyRow = renderBoundKeyPills(a.boundKeys, '<code>&lt;主Key&gt;@' + esc(a.id) + '</code>', '@' + a.id);
     const rawMods = Array.isArray(a.allowedModels) ? a.allowedModels : (Array.isArray(a.defaultModels) ? a.defaultModels : []);
     const dmods = summarizeAllowedModels(rawMods);
@@ -4248,7 +4253,7 @@ function renderAccountsList() {
               : '<button type="button" class="btn-sm" data-acc-act="drain" data-acc-id="' + esc(a.id) + '">' + svg('pause') + '<span>排空</span></button>'));
 
     return '<div class="acc-item">' +
-      '<div class="acc-item-top"><div class="acc-item-title"><span>' + esc(a.label || a.id) + '</span><code class="tag">' + esc(a.id) + '</code>' + (a.primary ? '<span class="tag def">主实例</span>' : '') + standbyBadge + agyVerBadge + stBadge + extraBadges + '</div>' +
+      '<div class="acc-item-top"><div class="acc-item-title"><span>' + esc(a.label || a.id) + '</span><code class="tag">' + esc(a.id) + '</code>' + (a.primary ? '<span class="tag def">主实例</span>' : '') + tierBadge + standbyBadge + agyVerBadge + stBadge + extraBadges + '</div>' +
       '<span class="m-note mono">' + esc(metaRight.join(' · ')) + '</span></div>' +
       '<div class="acc-kv">' +
       '<div class="acc-kv-row"><b>出口代理</b><span>' + esc(presetLabelOf(a.proxyPreset)) + (a.proxyPreset === 'custom' && a.customProxy ? ' (' + esc(a.customProxy) + ')' : '') + '</span></div>' +
@@ -4611,6 +4616,15 @@ function openAccountEditForm(acc) {
   ].map(([v, lbl]) =>
     '<option value="' + esc(v) + '"' + (curRole === v ? ' selected' : '') + '>' + esc(lbl) + '</option>'
   ).join('');
+  const curPlanTierOverride = String(a.planTierOverride || '');
+  const planTierOpts = [
+    ['', '自动探测 (Auto)'],
+    ['pro', 'AI Pro'],
+    ['ultra_5x', 'Ultra 5x'],
+    ['ultra', 'Ultra 20x'],
+  ].map(([v, lbl]) =>
+    '<option value="' + esc(v) + '"' + (curPlanTierOverride === v ? ' selected' : '') + '>' + esc(lbl) + '</option>'
+  ).join('');
   const curGrps = new Set((a.groups || []).map(s => String(s).toLowerCase()));
   const grpChecks = accState.groups.length
     ? '<div class="acc-grp-chips" id="ef-grp-checks" style="margin-bottom:6px">' + accState.groups.map(g =>
@@ -4628,6 +4642,7 @@ function openAccountEditForm(acc) {
     '<div class="acc-form-grid">' +
     '<label class="acc-field"><span>账号 ID</span><input type="text" id="ef-id" value="' + esc(a.id || '') + '" placeholder="例如 account-2"' + (!isNew ? ' readonly' : '') + '></label>' +
     '<label class="acc-field"><span>显示名称</span><input type="text" id="ef-label" value="' + esc(a.label || '') + '"></label>' +
+    '<label class="acc-field"><span>套餐档位 (Quota Tier)</span><select id="ef-plan-tier">' + planTierOpts + '</select></label>' +
     '<label class="acc-field"><span>出口代理</span><select id="ef-preset">' + presetOpts + '</select></label>' +
     '<div class="acc-field"><span>账号专属 API Key (选填，直连锁定本号)</span>' +
     '<div class="acc-field-inline"><input type="text" id="ef-keys" value="' + esc((a.boundKeys || []).join(', ')) + '" placeholder="留空则使用主Key或分组Key">' +
@@ -4747,6 +4762,8 @@ async function saveAccountForm() {
   const maxLiveWorkers = parseInt(document.getElementById('ef-workers').value, 10) || (isPrim ? 8 : 3);
   const boundKeys = (document.getElementById('ef-keys').value || '').split(',').map(s => s.trim()).filter(Boolean);
   const groups = (document.getElementById('ef-groups').value || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  const planTierEl = document.getElementById('ef-plan-tier');
+  const planTierOverride = planTierEl ? String(planTierEl.value || '').trim() : '';
   const notes = (document.getElementById('ef-notes').value || '').trim();
   const allowedModels = [...document.querySelectorAll('#ef-model-grid input[type="checkbox"]:checked')].map(cb => cb.value);
   if (enabled && allowedModels.length === 0) {
@@ -4759,7 +4776,7 @@ async function saveAccountForm() {
     const r = await fetch(apiBaseUrl() + 'api/accounts', {
       method: 'POST', credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json', 'X-Agy-Requested-With': 'dashboard' },
-      body: JSON.stringify({ id, label, enabled, schedState, role, priority, weight, maxConcurrency, groups, notes, proxyPreset, customProxy, maxLiveWorkers, boundKeys, allowedModels }),
+      body: JSON.stringify({ id, label, enabled, schedState, role, priority, weight, maxConcurrency, groups, notes, planTierOverride, proxyPreset, customProxy, maxLiveWorkers, boundKeys, allowedModels }),
     });
     const d = await r.json();
     if (!d.ok) throw new Error(d.error || ('HTTP ' + r.status));

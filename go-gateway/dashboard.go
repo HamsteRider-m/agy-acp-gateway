@@ -650,6 +650,8 @@ type creditsTierCacheEntry struct {
 func normalizePlanTierHint(raw string) string {
 	low := strings.ToLower(strings.TrimSpace(raw))
 	switch {
+	case (strings.Contains(low, "ultra") && (strings.Contains(low, "5x") || strings.Contains(low, "5×"))) || low == "ultra_5x" || low == "ultra-5x" || low == "5x" || strings.Contains(low, "g1-ultra-5x"):
+		return "ultra_5x"
 	case low == "pro" || strings.Contains(low, "google ai pro") || strings.Contains(low, "ai pro") || strings.Contains(low, "pro plan") || strings.Contains(low, "g1-pro"):
 		return "pro"
 	case low == "ultra" || strings.Contains(low, "ultra") || strings.Contains(low, "20x"):
@@ -663,6 +665,8 @@ func planLabelForTier(tier string) string {
 	switch normalizePlanTierHint(tier) {
 	case "pro":
 		return "AI Pro"
+	case "ultra_5x":
+		return "Ultra 5x"
 	case "ultra":
 		return "Ultra 20x"
 	default:
@@ -859,7 +863,24 @@ func resolveAuthoritativePlanTierFromCredits(binPath string, cmdEnv []string, pu
 	return detected
 }
 
+func authoritativeAccountPlanTierOverride() string {
+	if envOv := normalizePlanTierHint(gwcfg.Current().AccountPlanTierOverride); envOv != "" {
+		return envOv
+	}
+	if !isChildAccountWorker() && GlobalAccountManager != nil && GlobalAccountManager.HasConfiguredAccounts() {
+		if prim, ok := GlobalAccountManager.GetPrimaryAccount(); ok {
+			if ov := normalizePlanTierHint(prim.PlanTierOverride); ov != "" {
+				return ov
+			}
+		}
+	}
+	return ""
+}
+
 func authoritativeAccountPlanTierHint() string {
+	if ov := authoritativeAccountPlanTierOverride(); ov != "" {
+		return ov
+	}
 	if tier, fresh := cachedCreditsPlanTier(PureApiHome, quotaAgyBin()); fresh && tier != "" {
 		return tier
 	}
@@ -868,12 +889,34 @@ func authoritativeAccountPlanTierHint() string {
 	}
 	if !isChildAccountWorker() && GlobalAccountManager != nil && GlobalAccountManager.HasConfiguredAccounts() {
 		if prim, ok := GlobalAccountManager.GetPrimaryAccount(); ok {
-			if hint := normalizePlanTierHint(prim.PlanTierHint); hint != "" {
+			if hint := prim.EffectivePlanTier(); hint != "" {
 				return hint
 			}
 		}
 	}
 	return ""
+}
+
+// InvalidatePrimaryQuotaTierCache resets cached tier/view state when the primary
+// account's manual planTierOverride changes so dashboard views update immediately.
+func InvalidatePrimaryQuotaTierCache(overrideTier string) {
+	InvalidateCreditsTierCache(PureApiHome)
+	normOv := normalizePlanTierHint(overrideTier)
+	quotaMu.Lock()
+	if cachedQuota != nil {
+		if normOv != "" {
+			cachedQuota.PlanTier = normOv
+			cachedQuota.PlanLabel = planLabelForTier(normOv)
+		} else {
+			cachedQuota.PlanTier = ""
+			cachedQuota.PlanLabel = ""
+		}
+	}
+	quotaMu.Unlock()
+	dashStepsCacheMu.Lock()
+	dashViewGen = 0
+	dashViewQuotaKey = ""
+	dashStepsCacheMu.Unlock()
 }
 
 func hasNonNullJSON(raw json.RawMessage) bool {
@@ -1076,26 +1119,31 @@ func fetchOfficialQuotaDoWithHome(binPath string, cmdEnv []string, pureHome stri
 		Groups:             groups,
 	}
 	if len(groups) > 0 {
-		tier, label, definitive := detectQuotaPlanTierDetailed(snap)
-		if definitive {
-			snap.PlanTier = tier
-			snap.PlanLabel = label
+		if ov := authoritativeAccountPlanTierOverride(); ov != "" {
+			snap.PlanTier = ov
+			snap.PlanLabel = planLabelForTier(ov)
 		} else {
-			// Authoritative /credits (cached 6h per process) takes precedence over a
-			// potentially stale persisted AGY_ACCOUNT_PLAN_TIER_HINT so plan upgrades/
-			// downgrades or earlier heuristic misclassifications self-heal immediately.
-			hint := resolveAuthoritativePlanTierFromCredits(binPath, cmdEnv, pureHome)
-			if hint == "" {
-				hint = authoritativeAccountPlanTierHint()
+			tier, label, definitive := detectQuotaPlanTierDetailed(snap)
+			if definitive {
+				snap.PlanTier = tier
+				snap.PlanLabel = label
+			} else {
+				// Authoritative /credits (cached 6h per process) takes precedence over a
+				// potentially stale persisted AGY_ACCOUNT_PLAN_TIER_HINT so plan upgrades/
+				// downgrades or earlier heuristic misclassifications self-heal immediately.
+				hint := resolveAuthoritativePlanTierFromCredits(binPath, cmdEnv, pureHome)
+				if hint == "" {
+					hint = authoritativeAccountPlanTierHint()
+				}
+				if hint != "" {
+					snap.PlanTier = hint
+					snap.PlanLabel = planLabelForTier(hint)
+				}
 			}
-			if hint != "" {
-				snap.PlanTier = hint
-				snap.PlanLabel = planLabelForTier(hint)
-			}
-		}
-		if snap.PlanTier != "" && !isChildAccountWorker() && GlobalAccountManager != nil && GlobalAccountManager.HasConfiguredAccounts() {
-			if prim, ok := GlobalAccountManager.GetPrimaryAccount(); ok {
-				GlobalAccountManager.SetAccountPlanTierHint(prim.ID, snap.PlanTier)
+			if snap.PlanTier != "" && !isChildAccountWorker() && GlobalAccountManager != nil && GlobalAccountManager.HasConfiguredAccounts() {
+				if prim, ok := GlobalAccountManager.GetPrimaryAccount(); ok {
+					GlobalAccountManager.SetAccountPlanTierHint(prim.ID, snap.PlanTier)
+				}
 			}
 		}
 	}
@@ -1619,7 +1667,7 @@ func quotaWindowIdle(b *QuotaBucket, readAt string, length time.Duration) bool {
 }
 
 func pctUsdPtr(capUsd float64, frac *float64) *float64 {
-	if frac == nil {
+	if frac == nil || capUsd <= 0 {
 		return nil
 	}
 	v := roundTo(capUsd**frac, 2)
@@ -1650,7 +1698,15 @@ func descriptionHasProPlanCue(desc string) bool {
 		strings.Contains(low, "ai pro")
 }
 
+func descriptionHasUltra5xPlanCue(desc string) bool {
+	low := strings.ToLower(desc)
+	return strings.Contains(low, "ultra") && (strings.Contains(low, "5x") || strings.Contains(low, "5×"))
+}
+
 func descriptionHasUltraPlanCue(desc string) bool {
+	if descriptionHasUltra5xPlanCue(desc) {
+		return false
+	}
 	low := strings.ToLower(desc)
 	return strings.Contains(low, "google ai ultra") ||
 		strings.Contains(low, "ai ultra") ||
@@ -1658,21 +1714,28 @@ func descriptionHasUltraPlanCue(desc string) bool {
 		strings.Contains(low, "20x")
 }
 
-// detectQuotaPlanTierDetailed identifies whether the official /usage snapshot belongs to a Google AI Pro
-// plan or a Google AI Ultra (20x) plan and reports whether the heuristic signal was definitive.
+// detectQuotaPlanTierDetailed identifies whether the official /usage snapshot belongs to Google AI Pro,
+// Google AI Ultra 5x, or Google AI Ultra (20x) and reports whether the heuristic signal was definitive.
 func detectQuotaPlanTierDetailed(snap QuotaSnapshot) (tier, label string, definitive bool) {
+	if descriptionHasUltra5xPlanCue(snap.SummaryDescription) {
+		return "ultra_5x", "Ultra 5x", true
+	}
 	if descriptionHasProPlanCue(snap.SummaryDescription) {
 		return "pro", "AI Pro", true
 	}
 	hasGemini := false
 	geminiHasCarbon := false
 	geminiHasDesc := false
+	sawArgon := false
 	sawUltraCue := descriptionHasUltraPlanCue(snap.SummaryDescription)
 	for _, g := range snap.Groups {
 		lowName := strings.ToLower(strings.TrimSpace(g.Name))
 		lowDesc := strings.ToLower(g.Description)
 		if strings.Contains(lowName, "argon") && lowName != "gemini models" {
-			return "pro", "AI Pro", true
+			sawArgon = true
+		}
+		if descriptionHasUltra5xPlanCue(lowDesc) {
+			return "ultra_5x", "Ultra 5x", true
 		}
 		if descriptionHasProPlanCue(lowDesc) {
 			return "pro", "AI Pro", true
@@ -1682,7 +1745,10 @@ func detectQuotaPlanTierDetailed(snap QuotaSnapshot) (tier, label string, defini
 		}
 		for _, b := range g.Buckets {
 			if strings.Contains(strings.ToLower(b.ID), "argon") {
-				return "pro", "AI Pro", true
+				sawArgon = true
+			}
+			if descriptionHasUltra5xPlanCue(b.Description) {
+				return "ultra_5x", "Ultra 5x", true
 			}
 			if descriptionHasProPlanCue(b.Description) {
 				return "pro", "AI Pro", true
@@ -1701,11 +1767,11 @@ func detectQuotaPlanTierDetailed(snap QuotaSnapshot) (tier, label string, defini
 			}
 		}
 	}
-	if hasGemini && geminiHasDesc && !geminiHasCarbon {
-		return "pro", "AI Pro", true
-	}
 	if sawUltraCue {
 		return "ultra", "Ultra 20x", true
+	}
+	if sawArgon || (hasGemini && geminiHasDesc && !geminiHasCarbon) {
+		return "pro", "AI Pro", false
 	}
 	return "ultra", "Ultra 20x", false
 }
@@ -1735,11 +1801,15 @@ func buildQuotaView(quota QuotaSnapshot, allSteps []ParsedModelStep, now time.Ti
 }
 
 func buildQuotaViewAnnotated(quota QuotaSnapshot, annotatedAll []annotatedStep, precomputedAllTime *WindowAggregate, now time.Time) (QuotaSnapshot, map[string]WindowAggregate) {
+	ovTier := authoritativeAccountPlanTierOverride()
 	hintTier := normalizePlanTierHint(quota.PlanTier)
 	if hintTier == "" {
 		hintTier = authoritativeAccountPlanTierHint()
 	}
-	if len(quota.Groups) == 0 {
+	if ovTier != "" {
+		quota.PlanTier = ovTier
+		quota.PlanLabel = planLabelForTier(ovTier)
+	} else if len(quota.Groups) == 0 {
 		if hintTier != "" {
 			quota.PlanTier = hintTier
 			quota.PlanLabel = planLabelForTier(hintTier)
@@ -1761,6 +1831,10 @@ func buildQuotaViewAnnotated(quota QuotaSnapshot, annotatedAll []annotatedStep, 
 	if quota.PlanTier == "pro" {
 		gemPricing = ProGeminiPricing
 		claudePricing = ProClaudePoolPricing
+	} else if quota.PlanTier == "ultra_5x" {
+		// 5x dollar caps are not published by /usage; preserve real fractions without inventing 20x caps.
+		gemPricing.Cap5hUsd, gemPricing.CapWeeklyUsd = 0, 0
+		claudePricing.Cap5hUsd, claudePricing.CapWeeklyUsd = 0, 0
 	}
 
 	geminiGroup := findGroup(quota.Groups, reGeminiModelsGroup)
@@ -2831,7 +2905,7 @@ func BuildDashboardPayload(gw *GatewayServer, forceQuota bool) map[string]any {
 	hitViewCache := false
 	var viewKey string
 	if stepsGen > 0 {
-		viewKey = quotaViewCacheKey(quota, authoritativeAccountPlanTierHint())
+		viewKey = quotaViewCacheKey(quota, authoritativeAccountPlanTierOverride()+"|"+authoritativeAccountPlanTierHint())
 	}
 	if !forceQuota && stepsGen > 0 {
 		dashStepsCacheMu.Lock()

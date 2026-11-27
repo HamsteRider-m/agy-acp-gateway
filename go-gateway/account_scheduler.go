@@ -2759,7 +2759,7 @@ func narrowCandidatesByMonitorUtil(scored []candidateScore, weighted bool) []can
 	for i, c := range scored {
 		hc := c.monitorHardCap
 		if hc <= 0 {
-			_, _, hc = defaultMonitorCapsForTier(c.acc.PlanTierHint)
+			_, _, hc = defaultMonitorCapsForTier(c.acc.EffectivePlanTier())
 		}
 		u := (float64(c.monitorCalls) + float64(c.inFlight)*25.0) / float64(maxInt(hc, 1))
 		if weighted {

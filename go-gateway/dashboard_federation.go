@@ -913,6 +913,30 @@ func BuildFederatedDashboardPayload(gw *GatewayServer, forceQuota bool) map[stri
 				r, _ := pGw["tosTrippedReason"].(string)
 				GlobalAccountManager.RecordQuotaSyncOutcome(pID, "tos_circuit_breaker: "+r)
 			}
+			if accCfg, ok := GlobalAccountManager.GetAccount(pID); ok {
+				if ov := normalizePlanTierHint(accCfg.PlanTierOverride); ov != "" {
+					res.decoded.Quota.PlanTier = ov
+					res.decoded.Quota.PlanLabel = planLabelForTier(ov)
+					if ov == "ultra_5x" {
+						if d := res.decoded.Quota.Deduction; d != nil && (d.Cap5hUsd > 0 || d.CapWeeklyUsd > 0) {
+							d.Cap5hUsd, d.CapWeeklyUsd = 0, 0
+							d.PoolUsed5hUsd, d.PoolRem5hUsd = nil, nil
+							d.PoolUsedWeeklyUsd, d.PoolRemWeeklyUsd = nil, nil
+							d.EffectiveRemUsd = nil
+							d.Rem5hTokensAt99PctCache, d.Rem5hTokensAt0PctCache = nil, nil
+							d.RemWeeklyTokensAt99PctCache, d.RemWeeklyTokensAt0PctCache = nil, nil
+							d.RemEffectiveTokensAt99PctCache, d.RemEffectiveTokensAt0PctCache = nil, nil
+						}
+						if tp := res.decoded.Quota.ThirdPartyPool; tp != nil && (tp.Cap5hUsd > 0 || tp.CapWeeklyUsd > 0) {
+							tp.Cap5hUsd, tp.CapWeeklyUsd = 0, 0
+							tp.PoolUsed5hUsd, tp.PoolRem5hUsd = nil, nil
+							tp.PoolUsedWeeklyUsd, tp.PoolRemWeeklyUsd = nil, nil
+							tp.EffectiveRemUsd = nil
+							tp.RemEffectiveTokensAt99PctCache, tp.RemEffectiveTokensAt0PctCache = nil, nil
+						}
+					}
+				}
+			}
 			if len(res.decoded.Quota.Groups) > 0 {
 				if tier := normalizePlanTierHint(res.decoded.Quota.PlanTier); tier != "" {
 					GlobalAccountManager.SetAccountPlanTierHint(pID, tier)
